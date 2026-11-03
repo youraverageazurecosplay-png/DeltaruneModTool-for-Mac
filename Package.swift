@@ -8,7 +8,7 @@ let package = Package(
         .executable(name: "DeltaruneModManager", targets: ["DeltaruneModManager"])
     ],
     targets: [
-        .executableTarget(name: "DeltaruneModManager")
+        .executableTarget(name: "DeltaruneModManager", exclude: ["Resources"])
     ],
     swiftLanguageVersions: [.v5]
 )

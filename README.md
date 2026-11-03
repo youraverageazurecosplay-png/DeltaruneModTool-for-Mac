@@ -34,6 +34,8 @@ Build a macOS Installer package that installs only the mod manager into
 ```
 
 The generated `Deltarune Mod Manager.pkg` does not include DELTARUNE files.
+The app uses the supplied title-screen artwork as a darkened background and
+your supplied red heart image as its app icon.
 
 Run the patcher/archive validation with:
 

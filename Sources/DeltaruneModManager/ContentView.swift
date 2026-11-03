@@ -30,7 +30,22 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 600)
-        .background(Color(red: 0.045, green: 0.065, blue: 0.13))
+        .background {
+            GeometryReader { geometry in
+                ZStack {
+                    Color(red: 0.045, green: 0.065, blue: 0.13)
+                    if let image = titleBackground {
+                        Image(nsImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: geometry.size.width, height: geometry.size.height)
+                            .clipped()
+                            .overlay(Color(red: 0.015, green: 0.025, blue: 0.075).opacity(0.70))
+                    }
+                }
+            }
+            .ignoresSafeArea()
+        }
         .preferredColorScheme(.dark)
         .onAppear {
             if gameApp == nil {
@@ -57,6 +72,13 @@ struct ContentView: View {
                 model.cancelManualPatchSelection()
             }
         }
+    }
+
+    private var titleBackground: NSImage? {
+        guard let url = Bundle.main.url(forResource: "title-background", withExtension: "png") else {
+            return nil
+        }
+        return NSImage(contentsOf: url)
     }
 
     private var dashboard: some View {

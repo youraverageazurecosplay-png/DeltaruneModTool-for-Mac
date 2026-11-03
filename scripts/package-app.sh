@@ -16,7 +16,7 @@ pkgbuild \
     --component "$APP" \
     --install-location /Applications \
     --identifier com.local.deltarune-mod-manager \
-    --version 1.0.0 \
+    --version 1.0.1 \
     "$PKG"
 
 printf 'Built installer: %s\n' "$PKG"
