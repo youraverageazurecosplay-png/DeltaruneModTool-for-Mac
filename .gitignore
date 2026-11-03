@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+.DS_Store
+.vscode/
+/Base Game/
+/Deltarune Mod Manager.app/
+/Deltarune Mod Manager.pkg
+*.dSYM/
