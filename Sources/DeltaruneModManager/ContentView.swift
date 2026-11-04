@@ -144,6 +144,7 @@ struct ContentView: View {
                                 iconURL: model.iconURL(for: instance),
                                 launch: { model.launch(instance) },
                                 showCustomFiles: { model.showCustomFilesInFinder(for: instance) },
+                                showCustomMusic: { model.showCustomMusicInFinder(for: instance) },
                                 remove: { model.removeInstance(instance) },
                                 disabled: model.isBusy
                             )
@@ -277,7 +278,11 @@ private struct ManualPatchAssignmentSheet: View {
     private var assignments: [ManualPatchAssignment] {
         selection.options.compactMap { option in
             guard let chapter = selectedChapters[option.id], chapter > 0 else { return nil }
-            return ManualPatchAssignment(patchPath: option.path, chapter: chapter)
+            return ManualPatchAssignment(
+                patchPath: option.path,
+                chapter: chapter,
+                kind: option.kind
+            )
         }
     }
 
@@ -294,7 +299,7 @@ private struct ManualPatchAssignmentSheet: View {
                     .font(.system(size: 24))
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Assign patches to chapters")
+                    Text("Assign files to chapters")
                         .font(.system(size: 18, weight: .bold))
                     Text(selection.archive.lastPathComponent)
                         .font(.system(size: 11, design: .monospaced))
@@ -308,7 +313,7 @@ private struct ManualPatchAssignmentSheet: View {
                 }
                     .keyboardShortcut(.cancelAction)
             }
-            Text("Found \(selection.options.count) xdelta patch\(selection.options.count == 1 ? "" : "es"). Chapter numbers in patch names are selected automatically; you can change any selection. Leave patches set to Skip if you don't want them installed. Included lang_*.json files are applied to each selected chapter.")
+            Text("Found \(selection.options.count) installable file\(selection.options.count == 1 ? "" : "s"). Chapter numbers in filenames are selected automatically; you can change any selection. A data.win replaces that chapter's game file; xdelta files patch it. Leave files set to Skip if you don't want them installed. Included lang_*.json files are applied to each selected chapter.")
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.67))
                 .fixedSize(horizontal: false, vertical: true)
@@ -317,8 +322,8 @@ private struct ManualPatchAssignmentSheet: View {
                 VStack(spacing: 8) {
                     ForEach(selection.options) { option in
                         HStack(spacing: 12) {
-                            Image(systemName: "doc.zipper")
-                                .foregroundStyle(.cyan)
+                            Image(systemName: option.kind == .dataWin ? "externaldrive" : "doc.zipper")
+                                .foregroundStyle(option.kind == .dataWin ? .orange : .cyan)
                             Text(option.path)
                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                                 .lineLimit(2)
@@ -345,11 +350,11 @@ private struct ManualPatchAssignmentSheet: View {
             .frame(minHeight: 140, maxHeight: 340)
 
             HStack {
-                Text("\(assignments.count) patch\(assignments.count == 1 ? "" : "es") selected")
+                Text("\(assignments.count) file\(assignments.count == 1 ? "" : "s") selected")
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.5))
                 Spacer()
-                Button("Patch & Create Instance") {
+                Button("Create Instance") {
                     install(assignments)
                     dismiss()
                 }
@@ -517,6 +522,7 @@ private struct InstanceCard: View {
     let iconURL: URL?
     let launch: () -> Void
     let showCustomFiles: () -> Void
+    let showCustomMusic: () -> Void
     let remove: () -> Void
     let disabled: Bool
     @State private var confirmRemoval = false
@@ -553,7 +559,7 @@ private struct InstanceCard: View {
                 Text("\(instance.payloads.count) Mac file\(instance.payloads.count == 1 ? "" : "s") in this instance")
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.42))
-                Text("CustomFiles mirrors Contents/Resources (for example, mus/)")
+                Text("Add custom music in CustomFiles/mus; other files mirror Contents/Resources.")
                     .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.42))
                 if !instance.warnings.isEmpty {
@@ -584,6 +590,13 @@ private struct InstanceCard: View {
                 }
                 .buttonStyle(.bordered)
                 .help("Add custom game files in the matching resource folders. They are applied only while this mod is running.")
+                .disabled(disabled)
+                Button(action: showCustomMusic) {
+                    Label("Music Folder", systemImage: "music.note")
+                        .frame(minWidth: 112)
+                }
+                .buttonStyle(.bordered)
+                .help("Open this mod's CustomFiles/mus folder for custom songs.")
                 .disabled(disabled)
                 Button("Remove") { confirmRemoval = true }
                     .buttonStyle(.plain)

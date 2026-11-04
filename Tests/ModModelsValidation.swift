@@ -344,6 +344,49 @@ struct ModModelsValidation {
                 "\(resourcePath) wasn't patched from its selected xdelta."
             )
         }
+
+        let windowsChapter4 = windowsFolder.appendingPathComponent("chapter4_windows", isDirectory: true)
+        try fileManager.createDirectory(at: windowsChapter4, withIntermediateDirectories: true)
+        try Data("chapter four source".utf8).write(to: windowsChapter4.appendingPathComponent("data.win"))
+        try WindowsBackup.backup(from: windowsFolder, to: backupRoot)
+        let dataWinArchiveFolder = temporaryRoot.appendingPathComponent("DataWinMod", isDirectory: true)
+        let dataWinSourceDirectory = dataWinArchiveFolder
+            .appendingPathComponent("Chapter4_windows", isDirectory: true)
+        try fileManager.createDirectory(at: dataWinSourceDirectory, withIntermediateDirectories: true)
+        let replacementData = Data("complete chapter four data.win replacement".utf8)
+        try replacementData.write(to: dataWinSourceDirectory.appendingPathComponent("data.win"))
+        let dataWinArchive = temporaryRoot.appendingPathComponent("data-win-mod.zip")
+        try makeArchive(from: dataWinArchiveFolder, at: dataWinArchive)
+        let dataWinOptions = try DeltaModBuilder.manualPatchOptions(
+            archive: dataWinArchive,
+            supportRoot: appSupport
+        )
+        try require(
+            dataWinOptions.count == 1
+                && dataWinOptions[0].kind == .dataWin
+                && dataWinOptions[0].suggestedChapter == 4,
+            "A chapter-specific data.win wasn't detected as an assignable full replacement."
+        )
+        let replacementInstance = try DeltaModBuilder.buildManual(
+            archive: dataWinArchive,
+            assignments: [
+                ManualPatchAssignment(
+                    patchPath: "Chapter4_windows/data.win",
+                    chapter: 4,
+                    kind: .dataWin
+                )
+            ],
+            modName: "Raw data.win Replacement",
+            windowsBackup: backupRoot,
+            supportRoot: appSupport
+        )
+        let replacementPayload = try requirePayload("chapter4_mac/game.ios", in: replacementInstance.instance)
+        let replacementFile = replacementInstance.directory.appendingPathComponent("Payloads")
+            .appendingPathComponent(replacementPayload.instanceFile)
+        try require(
+            try Data(contentsOf: replacementFile) == replacementData,
+            "A selected data.win wasn't copied as a full chapter replacement."
+        )
         for chapter in [2, 3] {
             let languagePayload = try requirePayload(
                 "chapter\(chapter)_mac/lang/lang_en.json",

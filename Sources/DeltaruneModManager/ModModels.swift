@@ -30,7 +30,13 @@ struct ModBuildResult {
 }
 
 struct ManualPatchOption: Identifiable, Hashable {
+    enum Kind: String, Hashable {
+        case xdelta
+        case dataWin
+    }
+
     let path: String
+    var kind: Kind = .xdelta
     var id: String { path }
 
     var suggestedChapter: Int? {
@@ -48,6 +54,7 @@ struct ManualPatchOption: Identifiable, Hashable {
 struct ManualPatchAssignment: Hashable {
     let patchPath: String
     let chapter: Int
+    var kind: ManualPatchOption.Kind = .xdelta
 }
 
 struct ManualPatchSelection: Identifiable {
@@ -818,17 +825,27 @@ enum DeltaModBuilder {
         try extract(archive, to: extracted)
         let extractedPath = extracted.standardizedFileURL.path
         let extractedPrefix = extractedPath.hasSuffix("/") ? extractedPath : extractedPath + "/"
-        let patches = try findFiles(withExtension: "xdelta", in: extracted)
+        let files = try findFiles(in: extracted)
             .filter { url in
                 var isDirectory: ObjCBool = false
                 return fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) && !isDirectory.boolValue
             }
-            .map { String($0.standardizedFileURL.path.dropFirst(extractedPrefix.count)) }
-            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-        guard !patches.isEmpty else {
+            .compactMap { url -> ManualPatchOption? in
+                let path = String(url.standardizedFileURL.path.dropFirst(extractedPrefix.count))
+                switch url.pathExtension.lowercased() {
+                case "xdelta":
+                    return ManualPatchOption(path: path)
+                case "win" where url.lastPathComponent.caseInsensitiveCompare("data.win") == .orderedSame:
+                    return ManualPatchOption(path: path, kind: .dataWin)
+                default:
+                    return nil
+                }
+            }
+            .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        guard !files.isEmpty else {
             throw ModManagerError.missingManualPatch
         }
-        return patches.map { ManualPatchOption(path: $0) }
+        return files
     }
 
     static func buildManual(
@@ -844,7 +861,7 @@ enum DeltaModBuilder {
         guard assignments.allSatisfy({ (1...5).contains($0.chapter) }),
               Set(assignments.map(\.chapter)).count == assignments.count,
               Set(assignments.map(\.patchPath)).count == assignments.count else {
-            throw ModManagerError.unsupportedPatch("Each patch must be assigned to a unique chapter.")
+            throw ModManagerError.unsupportedPatch("Each selected file must be assigned to a unique chapter.")
         }
 
         let fileManager = FileManager.default
@@ -881,15 +898,20 @@ enum DeltaModBuilder {
             guard fileManager.fileExists(atPath: source.path) else {
                 throw ModManagerError.missingSource(sourceRelative)
             }
-            guard let xdelta = xdeltaExecutable() else {
-                throw ModManagerError.missingXdelta
-            }
             let destinationPath = "chapter\(assignment.chapter)_mac/game.ios"
             guard emittedTargets.insert(destinationPath).inserted else {
                 throw ModManagerError.unsupportedPatch("multiple patches target \(destinationPath)")
             }
             let output = payloadRoot.appendingPathComponent("Patched-\(assignment.chapter)-\(UUID().uuidString)")
-            try runXdelta(executable: xdelta, source: source, patch: patchURL, output: output)
+            switch assignment.kind {
+            case .xdelta:
+                guard let xdelta = xdeltaExecutable() else {
+                    throw ModManagerError.missingXdelta
+                }
+                try runXdelta(executable: xdelta, source: source, patch: patchURL, output: output)
+            case .dataWin:
+                try fileManager.copyItem(at: patchURL, to: output)
+            }
             manualPayloads.append(ModPayload(
                 resourcePath: destinationPath,
                 instanceFile: output.lastPathComponent
@@ -935,7 +957,7 @@ enum DeltaModBuilder {
             iconFile: iconFile,
             payloads: manualPayloads,
             warnings: assignments.map {
-                "Manually assigned \($0.patchPath) to Chapter \($0.chapter); verify it matches that chapter's backed-up Windows data.win."
+                "Manually assigned \($0.patchPath) to Chapter \($0.chapter) as a \($0.kind == .dataWin ? "full data.win replacement" : "patch"); verify it matches that chapter."
             }
         )
         try JSONEncoder.pretty.encode(instance)

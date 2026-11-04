@@ -386,6 +386,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func showCustomMusicInFinder(for instance: ModInstance) {
+        let directory = AppPaths.instanceDirectory(instance.id)
+            .appendingPathComponent("CustomFiles/mus", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            NSWorkspace.shared.open(directory)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     nonisolated private static var journalURL: URL {
         AppPaths.activeRun.appendingPathComponent("journal.json")
     }

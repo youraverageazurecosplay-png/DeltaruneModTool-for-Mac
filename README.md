@@ -68,10 +68,11 @@ scripts, directory/archive operations, and unsupported operation types are
 reported instead of run.
 
 Other manual ZIP and xdelta releases are downloaded or selected first, then
-analyzed for all `.xdelta` patches. Chapter numbers in patch names are selected
-automatically, and assignments can still be changed or skipped before creating
-the instance; each selected patch is applied to that chapter's backed-up Windows
-`data.win`. Manual patch ZIPs with `lang_*.json` files also
+analyzed for `.xdelta` patches and files named `data.win`. Chapter numbers in
+their paths are selected automatically, and assignments can still be changed
+or skipped before creating the instance. Xdelta patches apply to the selected
+chapter's backed-up Windows `data.win`; an included `data.win` replaces that
+chapter's game data file. Manual patch ZIPs with `lang_*.json` files also
 apply those language overrides to every selected chapter. **Only compatible
 mods** includes active Deltamod, G3M, and manual patch releases. You can
 also import a `.deltamod`, G3M ZIP, regular ZIP, or xdelta manually. Windows-only
@@ -84,5 +85,6 @@ a bounded URL cache to limit memory and cache-disk usage; installed instances
 and Windows backups are retained until you remove them. Use an instance's
 **Show in Finder** button to open its `CustomFiles` folder; place files there
 using paths relative to the game's `Contents/Resources` folder (for example,
-`CustomFiles/mus/custom.ogg`). These custom files override that instance's
-managed files only while it is running, and originals are restored afterward.
+`CustomFiles/mus/custom.ogg`). **Music Folder** opens or creates
+`CustomFiles/mus` for songs. These custom files override that instance's managed
+files only while it is running, and originals are restored afterward.
