@@ -389,6 +389,28 @@ struct ModModelsValidation {
         try require(GameBananaSort.popularity.apiValue == "popularity", "Popularity wasn't mapped to GameBanana's global order.")
         try require(GameBananaSort.newest.apiValue == "date", "Newest wasn't mapped to GameBanana's global order.")
         try require(GameBananaSort.recentlyUpdated.apiValue == "udate", "Recently updated wasn't mapped to GameBanana's global order.")
+        guard let oneClick = GameBananaOneClickLink(
+            url: URL(string: "g3m://https//gamebanana.com/mmdl/1863022,Mod,730367?toolid=20615")!
+        ) else {
+            throw validationError("G3M GameBanana one-click link wasn't parsed.")
+        }
+        try require(
+            oneClick.fileID == 1_863_022 && oneClick.modID == 730_367,
+            "G3M one-click IDs were parsed incorrectly."
+        )
+        guard let legacyOneClick = GameBananaOneClickLink(
+            url: URL(string: "deltahub://https//www.gamebanana.com/mmdl/123,Mod,456?toolid=1")!
+        ) else {
+            throw validationError("Legacy DELTAHUB one-click link wasn't parsed.")
+        }
+        try require(
+            legacyOneClick.fileID == 123 && legacyOneClick.modID == 456,
+            "Legacy one-click IDs were parsed incorrectly."
+        )
+        try require(
+            GameBananaOneClickLink(url: URL(string: "g3m://https//example.com/mmdl/1,Mod,2")!) == nil,
+            "An external host was accepted as a GameBanana one-click link."
+        )
         try require(
             GameBananaPagination.resultsPerPage * GameBananaPagination.initialPageCount == 30
                 && GameBananaPagination.prefetchCount == 15,

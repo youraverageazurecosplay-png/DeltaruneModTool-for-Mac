@@ -52,6 +52,9 @@ struct ContentView: View {
                 gameApp = model.setupGameApp
             }
         }
+        .onOpenURL { url in
+            model.handleOneClickInstall(url, catalog: catalog)
+        }
         .alert("Something went wrong", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }

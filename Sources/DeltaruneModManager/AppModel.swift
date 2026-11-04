@@ -203,6 +203,42 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func handleOneClickInstall(_ url: URL, catalog: GameBananaCatalog) {
+        guard GameBananaOneClickLink.usesSupportedScheme(url) else { return }
+        guard !isBusy else {
+            errorMessage = "Wait for the current mod operation to finish before using a one-click install."
+            return
+        }
+        guard settings != nil else {
+            errorMessage = "Complete setup and select your own game files before installing a mod."
+            return
+        }
+        guard let link = GameBananaOneClickLink(url: url) else {
+            errorMessage = "This GameBanana one-click link is invalid or uses an unsupported install type."
+            return
+        }
+
+        isBusy = true
+        statusMessage = "Finding the selected GameBanana release..."
+        Task {
+            do {
+                let details = try await catalog.details(forModID: link.modID)
+                guard let file = details.files.first(where: { $0.id == link.fileID }) else {
+                    throw GameBananaError.oneClickReleaseNotFound
+                }
+                guard file.isSelectableRelease else {
+                    throw GameBananaError.unsupportedDownload
+                }
+                isBusy = false
+                downloadAndInstall(file, modName: details.name)
+            } catch {
+                isBusy = false
+                statusMessage = ""
+                errorMessage = GameBananaError.message(for: error)
+            }
+        }
+    }
+
     func downloadAndInstall(_ file: GameBananaFile, modName: String) {
         guard !isBusy else { return }
         guard file.isSelectableRelease else {

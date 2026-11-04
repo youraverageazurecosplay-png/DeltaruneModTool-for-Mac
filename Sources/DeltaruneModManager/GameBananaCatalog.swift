@@ -209,6 +209,46 @@ struct GameBananaFile: Decodable, Identifiable {
     }
 }
 
+struct GameBananaOneClickLink: Equatable {
+    let fileID: Int
+    let modID: Int
+
+    static func usesSupportedScheme(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else { return false }
+        return scheme == "g3m" || scheme == "deltahub"
+    }
+
+    init?(url: URL) {
+        guard Self.usesSupportedScheme(url) else { return nil }
+        let link = url.absoluteString
+        guard let separator = link.range(of: "://") else { return nil }
+        var target = String(link[separator.upperBound...])
+        target = target
+            .replacingOccurrences(of: "https//", with: "https://")
+            .replacingOccurrences(of: "http//", with: "http://")
+        guard let components = URLComponents(string: target),
+              let host = components.host?.lowercased(),
+              host == "gamebanana.com" || host == "www.gamebanana.com" else {
+            return nil
+        }
+        let segments = components.path.split(separator: "/")
+        guard segments.count == 2,
+              segments[0].lowercased() == "mmdl" else {
+            return nil
+        }
+        let parameters = segments[1].split(separator: ",")
+        guard parameters.count >= 3,
+              parameters[1].lowercased() == "mod",
+              let fileID = Int(parameters[0]),
+              let modID = Int(parameters[2]),
+              fileID > 0, modID > 0 else {
+            return nil
+        }
+        self.fileID = fileID
+        self.modID = modID
+    }
+}
+
 enum GameBananaPagination {
     static let resultsPerPage = 15
     static let initialPageCount = 2
@@ -280,7 +320,11 @@ final class GameBananaCatalog: ObservableObject {
     }
 
     func details(for mod: GameBananaMod) async throws -> GameBananaItemDetails {
-        var components = URLComponents(string: "https://gamebanana.com/apiv11/Mod/\(mod.id)")!
+        try await details(forModID: mod.id)
+    }
+
+    func details(forModID id: Int) async throws -> GameBananaItemDetails {
+        var components = URLComponents(string: "https://gamebanana.com/apiv11/Mod/\(id)")!
         components.queryItems = [URLQueryItem(
             name: "_csvProperties",
             value: "_aFiles,_aPreviewMedia,_sName,_sProfileUrl,_sDescription"
@@ -403,6 +447,7 @@ enum GameBananaError: LocalizedError {
 
     case badResponse
     case unsupportedDownload
+    case oneClickReleaseNotFound
 
     static func isOffline(_ error: Error) -> Bool {
         let error = error as NSError
@@ -427,6 +472,8 @@ enum GameBananaError: LocalizedError {
             return "GameBanana returned an unexpected response. Please try again."
         case .unsupportedDownload:
             return "This file isn't a Deltamod, G3M ZIP, or supported manual ZIP/xdelta patch."
+        case .oneClickReleaseNotFound:
+            return "The release selected by this GameBanana one-click link is no longer available."
         }
     }
 }

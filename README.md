@@ -57,6 +57,8 @@ The catalog loads 30 mods initially, then preloads 15 more when you reach the
 middle of the loaded results. The GameBanana search API does not provide a
 global sort by view count. Mod details show each supported release as an
 expandable version choice, including archived versions.
+GameBanana G3M one-click links (`g3m://…/mmdl/<fileID>,Mod,<modID>`) and legacy
+`deltahub://` links open this app and install the specific linked release.
 Deltamod packages, modern G3M ZIPs containing `mod_config.json`, and legacy
 G3M packages containing `modding.xml` plus `meta.toml` are detected and
 imported automatically. G3M packages support DELTARUNE chapter patches using
