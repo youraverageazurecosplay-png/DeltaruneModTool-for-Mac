@@ -7,6 +7,7 @@ trap 'rm -rf "$TEMP_DIR"' EXIT
 
 cd "$ROOT"
 swiftc \
+  Sources/DeltaruneModManager/AppUpdate.swift \
   Sources/DeltaruneModManager/ModModels.swift \
   Sources/DeltaruneModManager/GameBananaCatalog.swift \
   Tests/ModModelsValidation.swift \

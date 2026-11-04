@@ -12,11 +12,8 @@ if [[ ! -x "$APP/Contents/MacOS/DeltaruneModManager" ]]; then
     exit 1
 fi
 
-pkgbuild \
-    --component "$APP" \
-    --install-location /Applications \
-    --identifier com.local.deltarune-mod-manager \
-    --version 1.0.3 \
-    "$PKG"
-
+if [[ ! -f "$PKG" ]]; then
+    printf 'Built installer package is missing.\n' >&2
+    exit 1
+fi
 printf 'Built installer: %s\n' "$PKG"

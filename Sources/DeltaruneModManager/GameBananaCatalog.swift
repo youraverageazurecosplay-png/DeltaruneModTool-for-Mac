@@ -9,6 +9,7 @@ struct GameBananaMod: Decodable, Identifiable, Hashable {
     let profileURL: URL
     let hasFiles: Bool
     let imageURL: URL?
+    let imageURLs: [URL]
     let author: String?
     let category: String?
     let likeCount: Int?
@@ -60,7 +61,8 @@ struct GameBananaMod: Decodable, Identifiable, Hashable {
         }
 
         let media = try container.decodeIfPresent(GameBananaMedia.self, forKey: .previewMedia)
-        imageURL = media?.images.first?.url
+        imageURLs = media?.imageURLs ?? []
+        imageURL = imageURLs.first
     }
 }
 
@@ -93,6 +95,7 @@ enum GameBananaSort: String, CaseIterable, Identifiable {
 
 private struct GameBananaMedia: Decodable {
     let images: [GameBananaImage]
+    var imageURLs: [URL] { images.flatMap(\.urls) }
 
     enum CodingKeys: String, CodingKey {
         case images = "_aImages"
@@ -105,9 +108,10 @@ private struct GameBananaMedia: Decodable {
 }
 
 private struct GameBananaImage: Decodable {
-    let url: URL?
+    let urls: [URL]
 
     enum CodingKeys: String, CodingKey {
+        case directURL = "_sUrl"
         case baseURL = "_sBaseUrl"
         case file530 = "_sFile530"
         case file220 = "_sFile220"
@@ -116,14 +120,19 @@ private struct GameBananaImage: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        let directURL = try container.decodeIfPresent(URL.self, forKey: .directURL)
         let base = try container.decodeIfPresent(String.self, forKey: .baseURL)
-        let file = try container.decodeIfPresent(String.self, forKey: .file530)
-            ?? container.decodeIfPresent(String.self, forKey: .file220)
-            ?? container.decodeIfPresent(String.self, forKey: .file)
-        if let base, let file {
-            url = URL(string: "\(base)/\(file)")
+        if let directURL {
+            urls = [directURL]
+        } else if let base {
+            let filenames = [
+                try container.decodeIfPresent(String.self, forKey: .file530),
+                try container.decodeIfPresent(String.self, forKey: .file),
+                try container.decodeIfPresent(String.self, forKey: .file220)
+            ].compactMap { $0 }
+            urls = filenames.compactMap { URL(string: "\(base)/\($0)") }
         } else {
-            url = nil
+            urls = []
         }
     }
 }
@@ -133,12 +142,15 @@ struct GameBananaItemDetails: Decodable {
     let profileURL: URL
     let description: String
     let files: [GameBananaFile]
+    let imageURL: URL?
+    let imageURLs: [URL]
 
     enum CodingKeys: String, CodingKey {
         case name = "_sName"
         case profileURL = "_sProfileUrl"
         case description = "_sDescription"
         case files = "_aFiles"
+        case previewMedia = "_aPreviewMedia"
     }
 
     init(from decoder: Decoder) throws {
@@ -147,6 +159,9 @@ struct GameBananaItemDetails: Decodable {
         profileURL = try container.decode(URL.self, forKey: .profileURL)
         description = try container.decodeIfPresent(String.self, forKey: .description) ?? ""
         files = try container.decodeIfPresent([GameBananaFile].self, forKey: .files) ?? []
+        let media = try container.decodeIfPresent(GameBananaMedia.self, forKey: .previewMedia)
+        imageURLs = media?.imageURLs ?? []
+        imageURL = imageURLs.first
     }
 }
 
@@ -257,10 +272,15 @@ enum GameBananaPagination {
     static func shouldPrefetch(visibleIndex: Int, loadedCount: Int) -> Bool {
         visibleIndex >= max(0, loadedCount - prefetchCount)
     }
+
+    static func shouldLoadCategoryMore(matchingCount: Int, canLoadMore: Bool) -> Bool {
+        canLoadMore && matchingCount < resultsPerPage
+    }
 }
 
 @MainActor
 final class GameBananaCatalog: ObservableObject {
+    @Published private(set) var game: ModGame = .deltarune
     @Published private(set) var mods: [GameBananaMod] = []
     @Published private(set) var isLoading = false
     @Published private(set) var canLoadMore = true
@@ -300,6 +320,14 @@ final class GameBananaCatalog: ObservableObject {
             guard requestGeneration == generation, canLoadMore, errorMessage == nil else { return }
             await loadMore()
         }
+    }
+
+    func setGame(_ newGame: ModGame) {
+        guard game != newGame else { return }
+        game = newGame
+        onlyCompatibleMods = false
+        compatibilityError = nil
+        Task { await search("") }
     }
 
     func loadMore() async {
@@ -349,6 +377,50 @@ final class GameBananaCatalog: ObservableObject {
         return destination
     }
 
+    nonisolated static func downloadImageData(from url: URL) async throws -> Data {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              host == "gamebanana.com" || host.hasSuffix(".gamebanana.com") else {
+            throw GameBananaError.badResponse
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
+        try Self.validate(response)
+        guard !data.isEmpty, data.count <= 10 * 1024 * 1024 else {
+            throw GameBananaError.badResponse
+        }
+        return data
+    }
+
+    nonisolated static func loadPreviewImage(from urls: [URL]) async -> NSImage? {
+        for url in urls {
+            guard url.scheme?.lowercased() == "https",
+                  let host = url.host?.lowercased(),
+                  host == "gamebanana.com" || host.hasSuffix(".gamebanana.com") else {
+                continue
+            }
+            for attempt in 0..<2 {
+                do {
+                    var request = URLRequest(url: url)
+                    request.cachePolicy = .returnCacheDataElseLoad
+                    request.timeoutInterval = 20
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    guard let response = response as? HTTPURLResponse,
+                          (200..<300).contains(response.statusCode),
+                          data.count <= 15 * 1024 * 1024,
+                          let image = NSImage(data: data) else {
+                        break
+                    }
+                    return image
+                } catch {
+                    if attempt == 0 {
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
     private func fetchPage(page: Int, generation: UUID) async {
         isLoading = true
         errorMessage = nil
@@ -360,9 +432,9 @@ final class GameBananaCatalog: ObservableObject {
 
         var components = URLComponents(string: "https://gamebanana.com/apiv11/Util/Search/Results")!
         components.queryItems = [
-            URLQueryItem(name: "_sSearchString", value: query.isEmpty ? "DELTARUNE" : query),
+            URLQueryItem(name: "_sSearchString", value: query.isEmpty ? game.title : query),
             URLQueryItem(name: "_sModelName", value: "Mod"),
-            URLQueryItem(name: "_idGameRow", value: "6755"),
+            URLQueryItem(name: "_idGameRow", value: game.gameBananaRow),
             URLQueryItem(name: "_nPage", value: String(page)),
             URLQueryItem(name: "_nPerpage", value: String(GameBananaPagination.resultsPerPage)),
             URLQueryItem(name: "_sOrder", value: sortOption.apiValue)
@@ -499,9 +571,9 @@ struct ModCatalogView: View {
         VStack(spacing: 0) {
             HStack(spacing: 14) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Discover DELTARUNE Mods")
+                    Text("Discover \(catalog.game.title) Mods")
                         .font(.system(size: 23, weight: .bold, design: .rounded))
-                    Text("Browse GameBanana's catalog and install Deltamod releases")
+                    Text("Browse GameBanana's \(catalog.game.title) catalog")
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.55))
                 }
@@ -550,6 +622,9 @@ struct ModCatalogView: View {
                     ForEach(categories, id: \.self) { category in
                         Button {
                             selectedCategory = category
+                            if category != "All Mods" {
+                                Task { await loadCategoryResults(category) }
+                            }
                         } label: {
                             Text(category)
                                 .font(.system(size: 11, weight: .semibold))
@@ -618,7 +693,7 @@ struct ModCatalogView: View {
                             Text("No mods in this tab yet")
                                 .font(.system(size: 17, weight: .bold))
                             Text(catalog.canLoadMore
-                                ? "Scroll down to load more DELTARUNE mods."
+                                ? "Scroll down to load more \(catalog.game.title) mods."
                                 : "Try another category or search term.")
                                 .font(.system(size: 12))
                                 .foregroundStyle(.white.opacity(0.55))
@@ -687,10 +762,41 @@ struct ModCatalogView: View {
         }
     }
 
+    private func categoryMatchCount(_ category: String) -> Int {
+        catalog.mods.filter { mod in
+            mod.category == category &&
+                (!catalog.onlyCompatibleMods || catalog.compatibleModIDs.contains(mod.id))
+        }.count
+    }
+
+    @MainActor
+    private func loadCategoryResults(_ category: String) async {
+        while selectedCategory == category {
+            guard catalog.canLoadMore else { return }
+            if catalog.isLoading {
+                do {
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                } catch {
+                    return
+                }
+                continue
+            }
+            guard GameBananaPagination.shouldLoadCategoryMore(
+                matchingCount: categoryMatchCount(category),
+                canLoadMore: catalog.canLoadMore
+            ) else { return }
+            let previousCount = catalog.mods.count
+            await catalog.loadMore()
+            if catalog.mods.count == previousCount || catalog.errorMessage != nil {
+                return
+            }
+        }
+    }
+
     private var loadingState: some View {
         VStack(spacing: 12) {
             ProgressView()
-            Text("Loading DELTARUNE mods from GameBanana…")
+            Text("Loading \(catalog.game.title) mods from GameBanana…")
                 .font(.system(size: 13))
                 .foregroundStyle(.white.opacity(0.55))
         }
@@ -740,18 +846,7 @@ private struct GameBananaModCard: View {
         Button(action: open) {
             VStack(alignment: .leading, spacing: 0) {
                 ZStack(alignment: .topTrailing) {
-                    AsyncImage(url: mod.imageURL) { phase in
-                        if let image = phase.image {
-                            image.resizable().scaledToFill()
-                        } else {
-                            Rectangle().fill(.white.opacity(0.06))
-                                .overlay {
-                                    Image(systemName: "gamecontroller")
-                                        .font(.system(size: 28))
-                                        .foregroundStyle(.white.opacity(0.2))
-                                }
-                        }
-                    }
+                    GameBananaPreviewImage(urls: mod.imageURLs)
                     .frame(height: 128)
                     .frame(maxWidth: .infinity)
                     .clipped()
@@ -770,7 +865,7 @@ private struct GameBananaModCard: View {
                         .foregroundStyle(.white)
                         .lineLimit(2)
                         .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
-                    Text(mod.category ?? "DELTARUNE Mod")
+                    Text(mod.category ?? "Game Mod")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(.cyan)
                         .lineLimit(1)
@@ -798,6 +893,32 @@ private struct GameBananaModCard: View {
     }
 }
 
+private struct GameBananaPreviewImage: View {
+    let urls: [URL]
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Rectangle().fill(.white.opacity(0.06))
+                    .overlay {
+                        Image(systemName: "gamecontroller")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.white.opacity(0.2))
+                    }
+            }
+        }
+        .task(id: urls) {
+            image = nil
+            image = await GameBananaCatalog.loadPreviewImage(from: urls)
+        }
+    }
+}
+
 struct GameBananaModDetailSheet: View {
     let mod: GameBananaMod
     @ObservedObject var catalog: GameBananaCatalog
@@ -806,6 +927,7 @@ struct GameBananaModDetailSheet: View {
     @State private var details: GameBananaItemDetails?
     @State private var error: String?
     @State private var isLoading = true
+    @State private var expandedReleaseIDs = Set<Int>()
 
     private var compatibleFiles: [GameBananaFile] {
         sortedReleases((details?.files ?? []).filter(\.isDeltamod).filter(\.isSelectableRelease))
@@ -862,12 +984,8 @@ struct GameBananaModDetailSheet: View {
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 17) {
-                        if let imageURL = mod.imageURL {
-                            AsyncImage(url: imageURL) { image in
-                                image.resizable().scaledToFill()
-                            } placeholder: {
-                                Rectangle().fill(.white.opacity(0.06))
-                            }
+                        if !mod.imageURLs.isEmpty {
+                            GameBananaPreviewImage(urls: mod.imageURLs)
                             .frame(height: 190)
                             .frame(maxWidth: .infinity)
                             .clipped()
@@ -940,55 +1058,70 @@ struct GameBananaModDetailSheet: View {
     }
 
     private func releaseDisclosure(_ file: GameBananaFile, tint: Color) -> some View {
-        DisclosureGroup {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(file.name)
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                    .textSelection(.enabled)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    if expandedReleaseIDs.contains(file.id) {
+                        expandedReleaseIDs.remove(file.id)
+                    } else {
+                        expandedReleaseIDs.insert(file.id)
+                    }
+                }
+            } label: {
                 HStack(spacing: 10) {
-                    Text(file.formattedSize)
-                    if file.isArchived {
-                        Text("Archived release").foregroundStyle(.orange)
+                    Image(systemName: file.isArchived ? "archivebox" : "shippingbox.fill")
+                        .foregroundStyle(tint)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(file.releaseTitle)
+                            .font(.system(size: 12, weight: .semibold))
+                            .lineLimit(2)
+                        if file.isArchived {
+                            Text("Archived version")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                        }
                     }
+                    Spacer()
+                    Image(systemName: expandedReleaseIDs.contains(file.id) ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.45))
                 }
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.white.opacity(0.52))
-                Button {
-                    downloadAndInstall(file)
-                    dismiss()
-                } label: {
-                    Label(
-                        file.isDeltamod ? "Download & Install" : "Download & Analyze",
-                        systemImage: "arrow.down.to.line"
-                    )
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(tint)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .padding(.top, 8)
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: file.isArchived ? "archivebox" : "shippingbox.fill")
-                    .foregroundStyle(tint)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(file.releaseTitle)
-                        .font(.system(size: 12, weight: .semibold))
-                        .lineLimit(2)
-                    if file.isArchived {
-                        Text("Archived version")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.orange)
+            .buttonStyle(.plain)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if expandedReleaseIDs.contains(file.id) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(file.name)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .textSelection(.enabled)
+                    HStack(spacing: 10) {
+                        Text(file.formattedSize)
+                        if file.isArchived {
+                            Text("Archived release").foregroundStyle(.orange)
+                        }
                     }
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.52))
+                    Button {
+                        downloadAndInstall(file)
+                        dismiss()
+                    } label: {
+                        Label(
+                            file.isDeltamod ? "Download & Install" : "Download & Analyze",
+                            systemImage: "arrow.down.to.line"
+                        )
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(tint)
                 }
-                Spacer()
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.45))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 12)
             }
-            .contentShape(Rectangle())
         }
-        .tint(.white.opacity(0.75))
-        .padding(12)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 10))
     }
 }

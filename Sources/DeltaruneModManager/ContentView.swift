@@ -18,6 +18,8 @@ struct ContentView: View {
     @StateObject private var catalog = GameBananaCatalog()
     @State private var section: MainSection = .discover
     @State private var selectedMod: GameBananaMod?
+    @State private var editingInstance: ModInstance?
+    @State private var instanceSearchText = ""
     @State private var windowsFolder: URL?
     @State private var gameApp: URL?
 
@@ -55,6 +57,11 @@ struct ContentView: View {
         .onOpenURL { url in
             model.handleOneClickInstall(url, catalog: catalog)
         }
+        .onChange(of: section) { newSection in
+            if newSection == .instances {
+                model.checkForModUpdates(catalog: catalog)
+            }
+        }
         .alert("Something went wrong", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
@@ -65,15 +72,24 @@ struct ContentView: View {
         }
         .sheet(item: $selectedMod) { mod in
             GameBananaModDetailSheet(mod: mod, catalog: catalog) { file in
-                model.downloadAndInstall(file, modName: mod.name)
+                model.downloadAndInstall(
+                    file,
+                    modName: mod.name,
+                    gameBananaIconURL: mod.imageURL,
+                    game: .deltarune,
+                    gameBananaModID: mod.id
+                )
             }
         }
         .sheet(item: $model.manualPatchSelection) { selection in
-            ManualPatchAssignmentSheet(selection: selection) { assignments in
-                model.installManualArchive(selection, assignments: assignments)
+            ManualPatchAssignmentSheet(selection: selection, actionTitle: "Create Instance") { assignments, name in
+                model.installManualArchive(selection, assignments: assignments, modName: name)
             } cancel: {
                 model.cancelManualPatchSelection()
             }
+        }
+        .sheet(item: $editingInstance) { instance in
+            InstanceEditorSheet(instance: instance, model: model)
         }
     }
 
@@ -84,34 +100,96 @@ struct ContentView: View {
         return NSImage(contentsOf: url)
     }
 
+    private var filteredInstances: [ModInstance] {
+        let query = instanceSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentGameInstances = model.instances.filter { $0.targetGame == .deltarune }
+        guard !query.isEmpty else { return currentGameInstances }
+        return currentGameInstances.filter { instance in
+            ([instance.name, instance.version, instance.description] + instance.authors)
+                .contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+    }
+
     private var dashboard: some View {
         VStack(spacing: 0) {
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 5) {
-                    Text("DELTARUNE")
-                        .font(.system(size: 28, weight: .black, design: .rounded))
-                        .tracking(3)
-                    Text("MOD MANAGER")
-                        .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .tracking(4)
-                        .foregroundStyle(.cyan)
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 0) {
+                            Text("DELT")
+                                .tracking(2)
+                            Text("A")
+                                .tracking(2)
+                                .overlay {
+                                    Image(systemName: "heart.fill")
+                                        .font(.system(size: 8, weight: .black))
+                                        .foregroundStyle(.red)
+                                        .offset(y: 1)
+                                }
+                            Text("RUNE")
+                                .tracking(2)
+                        }
+                        .font(.system(size: 27, weight: .black, design: .rounded))
+                        .fixedSize()
+                        HStack(spacing: 8) {
+                            Text("MOD MANAGER")
+                                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                                .tracking(3)
+                                .foregroundStyle(.cyan)
+                            Text("made by toast")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
+                    }
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Button {
+                            model.checkForUpdates()
+                        } label: {
+                            if model.isCheckingForUpdates {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .frame(width: 20)
+                            } else {
+                                Label("Update", systemImage: "arrow.down.circle")
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(model.isBusy || model.isCheckingForUpdates)
+                        .help("Check for a newer version and open its installer download page.")
+                        .fixedSize()
+
+                        Button {
+                            model.launchVanilla(for: .deltarune)
+                        } label: {
+                            Label("Launch Vanilla", systemImage: "gamecontroller")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(model.isBusy)
+                        .help("Launch DELTARUNE without applying a mod instance.")
+                        .fixedSize()
+
+                        Button {
+                            chooseModArchive()
+                        } label: {
+                            Label("Install Mod", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.indigo)
+                        .disabled(model.isBusy)
+                        .fixedSize()
+                    }
                 }
-                Spacer()
-                HStack(spacing: 4) {
+
+                HStack(spacing: 8) {
                     sectionButton(.discover, title: "Discover", icon: "sparkle.magnifyingglass")
                     sectionButton(.instances, title: "My Mods", icon: "square.stack.3d.up")
+                    sectionButton(.settings, title: "Settings", icon: "gearshape")
+                    Spacer(minLength: 0)
                 }
-                Button {
-                    chooseModArchive()
-                } label: {
-                    Label("Install Mod", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.indigo)
-                .disabled(model.isBusy)
             }
             .padding(.horizontal, 28)
-            .padding(.vertical, 22)
+            .padding(.vertical, 16)
 
             Rectangle().fill(.white.opacity(0.12)).frame(height: 1)
 
@@ -133,24 +211,89 @@ struct ContentView: View {
 
             if section == .discover {
                 ModCatalogView(catalog: catalog, select: { selectedMod = $0 })
-            } else if model.instances.isEmpty {
+            } else if section == .settings {
+                settingsPage
+            } else if filteredInstances.isEmpty && instanceSearchText.isEmpty {
                 installedEmptyState
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 14) {
-                        ForEach(model.instances) { instance in
-                            InstanceCard(
-                                instance: instance,
-                                iconURL: model.iconURL(for: instance),
-                                launch: { model.launch(instance) },
-                                showCustomFiles: { model.showCustomFilesInFinder(for: instance) },
-                                showCustomMusic: { model.showCustomMusicInFinder(for: instance) },
-                                remove: { model.removeInstance(instance) },
-                                disabled: model.isBusy
-                            )
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundStyle(.white.opacity(0.55))
+                        TextField("Search your mods", text: $instanceSearchText)
+                            .textFieldStyle(.plain)
+                        if !instanceSearchText.isEmpty {
+                            Button {
+                                instanceSearchText = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.white.opacity(0.55))
+                            }
+                            .buttonStyle(.plain)
+                            .fixedSize()
                         }
                     }
-                    .padding(24)
+                    .padding(11)
+                    .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                    .padding(.horizontal, 24)
+                    .padding(.top, 18)
+
+                    if filteredInstances.isEmpty {
+                        VStack(spacing: 10) {
+                            Image(systemName: "magnifyingglass")
+                                .font(.system(size: 30))
+                                .foregroundStyle(.white.opacity(0.45))
+                            Text("No matching mods")
+                                .font(.system(size: 16, weight: .semibold))
+                            Text("Try a different name, version, description, or author.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.white.opacity(0.55))
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ScrollView {
+                            LazyVStack(alignment: .trailing, spacing: 14) {
+                                if !model.availableModUpdates.isEmpty {
+                                    Button {
+                                        model.updateAllMods(catalog: catalog)
+                                    } label: {
+                                        Label(
+                                            "Update All (\(model.availableModUpdates.count))",
+                                            systemImage: "arrow.triangle.2.circlepath"
+                                        )
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.indigo)
+                                    .disabled(model.isBusy || model.isCheckingModUpdates)
+                                }
+                                if model.isCheckingModUpdates {
+                                    ProgressView("Checking for mod updates…")
+                                        .font(.system(size: 11))
+                                }
+                                LazyVStack(spacing: 14) {
+                                ForEach(filteredInstances) { instance in
+                                    InstanceCard(
+                                        instance: instance,
+                                        iconURL: model.iconURL(for: instance),
+                                        launch: { model.launch(instance) },
+                                        update: model.availableModUpdates[instance.id].map { file in
+                                            { model.updateMod(instance, using: file, catalog: catalog) }
+                                        },
+                                        showCustomFiles: { model.showCustomFilesInFinder(for: instance) },
+                                        showCustomMusic: { model.showCustomMusicInFinder(for: instance) },
+                                        replaceSkippedFile: { skippedFile in
+                                            chooseDylibReplacement(skippedFile, for: instance)
+                                        },
+                                        edit: { editingInstance = instance },
+                                        remove: { model.removeInstance(instance) },
+                                        disabled: model.isBusy
+                                    )
+                                }
+                                }
+                            }
+                            .padding(24)
+                        }
+                    }
                 }
             }
 
@@ -167,6 +310,62 @@ struct ContentView: View {
             .padding(.horizontal, 28)
             .padding(.vertical, 13)
         }
+    }
+
+    private var settingsPage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Settings")
+                .font(.system(size: 25, weight: .bold, design: .rounded))
+            Text("Manage the game locations used for mod installation and launch.")
+                .font(.system(size: 13))
+                .foregroundStyle(.white.opacity(0.62))
+
+            SetupPathRow(
+                number: "01",
+                title: "Mac DELTARUNE.app",
+                detail: "Select the installed Mac game app.",
+                path: model.settings?.gameAppPath,
+                buttonTitle: "Change App",
+                action: chooseGameAppForSettings
+            )
+            SetupPathRow(
+                number: "02",
+                title: "Windows game source",
+                detail: "Choose the folder containing chapterN_windows/data.win.",
+                path: model.settings?.windowsSourcePath ?? "Original source path not saved",
+                buttonTitle: "Choose & Back Up",
+                action: chooseWindowsBackupSource
+            )
+            HStack(spacing: 10) {
+                Image(systemName: "externaldrive")
+                    .foregroundStyle(.cyan)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Current Windows backup")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(model.settings?.windowsBackupPath ?? "")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.52))
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Button("Show in Finder", systemImage: "folder") {
+                    model.showWindowsBackupInFinder()
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isBusy)
+            }
+            .padding(15)
+            .background(.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
+
+            Text("Changing the Windows source creates a fresh backup for future installs. Existing mod instances keep their current patched files.")
+                .font(.system(size: 11))
+                .foregroundStyle(.white.opacity(0.48))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer()
+        }
+        .padding(28)
+        .frame(maxWidth: 760, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var installedEmptyState: some View {
@@ -199,18 +398,24 @@ struct ContentView: View {
         Button {
             section = item
         } label: {
-            Label(title, systemImage: icon)
-                .font(.system(size: 12, weight: .semibold))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .foregroundStyle(section == item ? .white : .white.opacity(0.55))
-                .background {
-                    if section == item {
-                        RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.11))
-                    }
+            HStack(spacing: 7) {
+                Image(systemName: icon)
+                Text(title)
+                    .lineLimit(1)
+            }
+            .font(.system(size: 12, weight: .semibold))
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .foregroundStyle(section == item ? .white : .white.opacity(0.75))
+            .background {
+                if section == item {
+                    RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.11))
                 }
+            }
         }
         .buttonStyle(.plain)
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func chooseModArchive() {
@@ -232,63 +437,109 @@ struct ContentView: View {
             } else {
                 model.analyzeManualArchive(
                     url,
-                    modName: url.deletingPathExtension().lastPathComponent
+                    modName: url.deletingPathExtension().lastPathComponent,
+                    game: .deltarune
                 )
             }
         } catch {
             model.errorMessage = error.localizedDescription
         }
     }
+
+    private func chooseDylibReplacement(_ skippedFile: ModSkippedFile, for instance: ModInstance) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose a Mac replacement for \(skippedFile.targetPath)"
+        panel.message = "Choose a compatible macOS .dylib. It will be installed as \(skippedFile.macReplacementPath) when this mod instance launches."
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "dylib") ?? .data]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.replaceSkippedFile(skippedFile, with: url, in: instance)
+    }
+
+    private func chooseGameAppForSettings() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Mac DELTARUNE.app"
+        panel.message = "Choose the installed Mac game app used for modded and vanilla launches."
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.updateGameApp(to: url)
+    }
+
+    private func chooseWindowsBackupSource() {
+        let panel = NSOpenPanel()
+        panel.title = "Select Windows DELTARUNE folder"
+        panel.message = "Choose the folder containing chapterN_windows/data.win files."
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        model.updateWindowsBackup(from: url)
+    }
+
 }
 
 private enum MainSection {
     case discover
     case instances
+    case settings
 }
 
-private struct ManualPatchAssignmentSheet: View {
+struct ManualPatchAssignmentSheet: View {
     let selection: ManualPatchSelection
-    let install: ([ManualPatchAssignment]) -> Void
+    let actionTitle: String
+    let install: ([ManualPatchAssignment], String) -> Void
     let cancel: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedChapters: [String: Int]
+    @State private var selectedTargets: [String: ManualPatchTarget]
+    @State private var modName: String
 
     init(
         selection: ManualPatchSelection,
-        install: @escaping ([ManualPatchAssignment]) -> Void,
+        actionTitle: String,
+        install: @escaping ([ManualPatchAssignment], String) -> Void,
         cancel: @escaping () -> Void
     ) {
         self.selection = selection
+        self.actionTitle = actionTitle
         self.install = install
         self.cancel = cancel
+        _modName = State(initialValue: selection.modName)
 
-        var defaults: [String: Int] = [:]
-        var usedChapters = Set<Int>()
+        var defaults: [String: ManualPatchTarget] = [:]
+        var usedTargets = Set<ManualPatchTarget>()
         for option in selection.options {
-            guard let chapter = option.suggestedChapter,
-                  usedChapters.insert(chapter).inserted else {
-                defaults[option.id] = 0
-                continue
+            let target: ManualPatchTarget?
+            if option.suggestsLauncher {
+                target = .launcher
+            } else {
+                target = option.suggestedChapter.map(ManualPatchTarget.chapter)
             }
-            defaults[option.id] = chapter
+            guard let target else { continue }
+            if option.kind != .dylib, !usedTargets.insert(target).inserted { continue }
+            defaults[option.id] = target
         }
-        _selectedChapters = State(initialValue: defaults)
+        _selectedTargets = State(initialValue: defaults)
     }
 
     private var assignments: [ManualPatchAssignment] {
         selection.options.compactMap { option in
-            guard let chapter = selectedChapters[option.id], chapter > 0 else { return nil }
+            guard let target = selectedTargets[option.id] else { return nil }
             return ManualPatchAssignment(
                 patchPath: option.path,
-                chapter: chapter,
+                target: target,
                 kind: option.kind
             )
         }
     }
 
-    private func chapterIsUsed(_ chapter: Int, by option: ManualPatchOption) -> Bool {
-        selection.options.contains {
-            $0.id != option.id && selectedChapters[$0.id] == chapter
+    private func targetIsUsed(_ target: ManualPatchTarget, by option: ManualPatchOption) -> Bool {
+        option.kind != .dylib && selection.options.contains {
+            $0.id != option.id && $0.kind != .dylib && selectedTargets[$0.id] == target
         }
     }
 
@@ -299,7 +550,7 @@ private struct ManualPatchAssignmentSheet: View {
                     .font(.system(size: 24))
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Assign files to chapters")
+                    Text("Assign files to game targets")
                         .font(.system(size: 18, weight: .bold))
                     Text(selection.archive.lastPathComponent)
                         .font(.system(size: 11, design: .monospaced))
@@ -313,34 +564,47 @@ private struct ManualPatchAssignmentSheet: View {
                 }
                     .keyboardShortcut(.cancelAction)
             }
-            Text("Found \(selection.options.count) installable file\(selection.options.count == 1 ? "" : "s"). Chapter numbers in filenames are selected automatically; you can change any selection. A data.win replaces that chapter's game file; xdelta files patch it. Leave files set to Skip if you don't want them installed. Included lang_*.json files are applied to each selected chapter.")
+            Text("Found \(selection.options.count) installable file\(selection.options.count == 1 ? "" : "s"). Chapter and launcher names are selected automatically; you can change any selection. Launcher patches use the backed-up Windows root data.win and target the Mac app's root game.ios. Chapter files target their matching game file; dylibs are copied into the selected chapter folder. Leave files set to Skip if you don't want them installed.")
                 .font(.system(size: 12))
                 .foregroundStyle(.white.opacity(0.67))
                 .fixedSize(horizontal: false, vertical: true)
+
+            TextField("Name", text: $modName)
+                .textFieldStyle(.roundedBorder)
 
             ScrollView {
                 VStack(spacing: 8) {
                     ForEach(selection.options) { option in
                         HStack(spacing: 12) {
-                            Image(systemName: option.kind == .dataWin ? "externaldrive" : "doc.zipper")
-                                .foregroundStyle(option.kind == .dataWin ? .orange : .cyan)
+                            Image(systemName: iconName(for: option.kind))
+                                .foregroundStyle(option.kind == .dataWin ? .orange : option.kind == .dylib ? .purple : .cyan)
                             Text(option.path)
                                 .font(.system(size: 12, weight: .medium, design: .monospaced))
                                 .lineLimit(2)
                                 .textSelection(.enabled)
                             Spacer(minLength: 8)
-                            Picker("Chapter", selection: Binding(
-                                get: { selectedChapters[option.id] ?? 0 },
-                                set: { selectedChapters[option.id] = $0 }
+                            Picker("Target", selection: Binding(
+                                get: { selectedTargets[option.id] },
+                                set: { target in
+                                    if let target {
+                                        selectedTargets[option.id] = target
+                                    } else {
+                                        selectedTargets.removeValue(forKey: option.id)
+                                    }
+                                }
                             )) {
-                                Text("Skip").tag(0)
-                                ForEach(1...5, id: \.self) { chapter in
-                                    Text("Chapter \(chapter)")
-                                        .tag(chapter)
-                                        .disabled(chapterIsUsed(chapter, by: option))
+                                Text("Skip").tag(nil as ManualPatchTarget?)
+                                if option.kind != .dylib {
+                                    Text("Launcher").tag(ManualPatchTarget.launcher as ManualPatchTarget?)
+                                        .disabled(targetIsUsed(.launcher, by: option))
+                                    ForEach(1...5, id: \.self) { chapter in
+                                        Text("Chapter \(chapter)")
+                                            .tag(ManualPatchTarget.chapter(chapter) as ManualPatchTarget?)
+                                            .disabled(targetIsUsed(.chapter(chapter), by: option))
+                                    }
                                 }
                             }
-                            .frame(width: 145)
+                            .frame(width: 155)
                         }
                         .padding(10)
                         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 9))
@@ -354,19 +618,27 @@ private struct ManualPatchAssignmentSheet: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.white.opacity(0.5))
                 Spacer()
-                Button("Create Instance") {
-                    install(assignments)
+                Button(actionTitle) {
+                    install(assignments, modName)
                     dismiss()
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.orange)
-                .disabled(assignments.isEmpty)
+                .disabled(assignments.isEmpty || modName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24)
-        .frame(width: 650, height: 510)
+        .frame(width: 720, height: 540)
         .preferredColorScheme(.dark)
         .interactiveDismissDisabled()
+    }
+
+    private func iconName(for kind: ManualPatchOption.Kind) -> String {
+        switch kind {
+        case .xdelta: "doc.zipper"
+        case .dataWin: "externaldrive"
+        case .dylib: "shippingbox"
+        }
     }
 }
 
@@ -400,7 +672,7 @@ private struct SetupView: View {
             VStack(alignment: .leading, spacing: 20) {
                 Text("One-time setup")
                     .font(.system(size: 25, weight: .bold, design: .rounded))
-                Text("Install DELTARUNE through Steam, then select your local Windows chapter files and Mac game app. Steam handles ownership and game downloads; this manager does not download or include game files.")
+                Text("Install DELTARUNE, then select your local Windows chapter files and Mac game app. This manager uses the game files you provide and does not download or include them.")
                     .foregroundStyle(.white.opacity(0.68))
                     .font(.system(size: 14))
                     .lineSpacing(4)
@@ -424,7 +696,7 @@ private struct SetupView: View {
 
                 HStack(alignment: .top, spacing: 9) {
                     Image(systemName: "info.circle.fill").foregroundStyle(.cyan)
-                    Text("Steam verifies ownership and installs the official game. Select the Windows folder containing chapterN_windows/data.win and the installed Mac app below.")
+                    Text("Select the Windows folder containing chapterN_windows/data.win files and the installed Mac app below.")
                         .font(.system(size: 12))
                         .foregroundStyle(.white.opacity(0.68))
                     Spacer(minLength: 4)
@@ -521,8 +793,11 @@ private struct InstanceCard: View {
     let instance: ModInstance
     let iconURL: URL?
     let launch: () -> Void
+    let update: (() -> Void)?
     let showCustomFiles: () -> Void
     let showCustomMusic: () -> Void
+    let replaceSkippedFile: (ModSkippedFile) -> Void
+    let edit: () -> Void
     let remove: () -> Void
     let disabled: Bool
     @State private var confirmRemoval = false
@@ -542,25 +817,13 @@ private struct InstanceCard: View {
                             .foregroundStyle(.cyan)
                     }
                 }
-                if !instance.authors.isEmpty {
-                    Text("by \(instance.authors.joined(separator: ", "))")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.white.opacity(0.52))
-                }
-                if let targetVersion = instance.targetGameVersion, !targetVersion.isEmpty {
-                    Text("DELTARUNE target \(targetVersion)")
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.cyan.opacity(0.75))
-                }
+
                 Text(instance.description)
                     .font(.system(size: 12))
                     .foregroundStyle(.white.opacity(0.72))
                     .lineLimit(3)
                 Text("\(instance.payloads.count) Mac file\(instance.payloads.count == 1 ? "" : "s") in this instance")
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.42))
-                Text("Add custom music in CustomFiles/mus; other files mirror Contents/Resources.")
-                    .font(.system(size: 10))
                     .foregroundStyle(.white.opacity(0.42))
                 if !instance.warnings.isEmpty {
                     DisclosureGroup("Compatibility notes (\(instance.warnings.count))") {
@@ -570,6 +833,25 @@ private struct InstanceCard: View {
                                 .foregroundStyle(.orange.opacity(0.85))
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        ForEach(instance.skippedFiles ?? []) { skippedFile in
+                            HStack(alignment: .top, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Windows-only file: \(skippedFile.targetPath)")
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(.orange.opacity(0.9))
+                                    Text("Choose a Mac .dylib to replace it at \(skippedFile.macReplacementPath).")
+                                        .font(.system(size: 10))
+                                        .foregroundStyle(.white.opacity(0.58))
+                                }
+                                Spacer(minLength: 4)
+                                Button("Repatch with .dylib…") {
+                                    replaceSkippedFile(skippedFile)
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(disabled)
+                            }
+                            .padding(.vertical, 4)
+                        }
                     }
                     .font(.system(size: 11))
                     .tint(.orange)
@@ -577,6 +859,12 @@ private struct InstanceCard: View {
             }
             Spacer(minLength: 10)
             VStack(spacing: 9) {
+                Button(action: edit) {
+                    Label("Edit", systemImage: "slider.horizontal.3")
+                        .frame(minWidth: 86)
+                }
+                .buttonStyle(.bordered)
+                .disabled(disabled)
                 Button(action: launch) {
                     Label("Play", systemImage: "play.fill")
                         .frame(minWidth: 86)
@@ -584,20 +872,31 @@ private struct InstanceCard: View {
                 .buttonStyle(.borderedProminent)
                 .tint(.indigo)
                 .disabled(disabled)
+                if let update {
+                    Button(action: update) {
+                        Label("Update Mod", systemImage: "arrow.triangle.2.circlepath")
+                            .frame(minWidth: 112)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.green)
+                    .disabled(disabled)
+                }
                 Button(action: showCustomFiles) {
                     Label("Show in Finder", systemImage: "folder")
                         .frame(minWidth: 112)
                 }
                 .buttonStyle(.bordered)
-                .help("Add custom game files in the matching resource folders. They are applied only while this mod is running.")
+                .help("Open the empty folder tree matching Contents/Resources. Add a file at its matching path (for example chapter3_mac/helper.dylib); it is applied only while this mod runs.")
                 .disabled(disabled)
-                Button(action: showCustomMusic) {
-                    Label("Music Folder", systemImage: "music.note")
-                        .frame(minWidth: 112)
+                if instance.targetGame == .deltarune {
+                    Button(action: showCustomMusic) {
+                        Label("Music Folder", systemImage: "music.note")
+                            .frame(minWidth: 112)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Open this mod's CustomFiles/mus folder for custom songs.")
+                    .disabled(disabled)
                 }
-                .buttonStyle(.bordered)
-                .help("Open this mod's CustomFiles/mus folder for custom songs.")
-                .disabled(disabled)
                 Button("Remove") { confirmRemoval = true }
                     .buttonStyle(.plain)
                     .font(.system(size: 11))
@@ -605,6 +904,7 @@ private struct InstanceCard: View {
                     .disabled(disabled)
             }
         }
+
         .padding(17)
         .background(.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 15))
         .overlay {

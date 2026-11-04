@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/Deltarune Mod Manager.app"
+PKG="$ROOT/Deltarune Mod Manager.pkg"
 ICONSET="$ROOT/.build/AppIcon-UserAsset.iconset"
 ICON_PNG="$ROOT/Sources/DeltaruneModManager/Resources/app-icon.png"
 
@@ -18,6 +19,7 @@ done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 cp "$ROOT/Sources/DeltaruneModManager/Resources/title-background.png" \
     "$APP/Contents/Resources/title-background.png"
+rm -f "$APP/Contents/Resources/undertale-background.png"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -59,3 +61,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 printf 'Built: %s\n' "$APP"
+
+pkgbuild \
+    --component "$APP" \
+    --install-location /Applications \
+    --identifier com.local.deltarune-mod-manager \
+    --version 1.0.3 \
+    "$PKG"
+
+printf 'Built installer: %s\n' "$PKG"

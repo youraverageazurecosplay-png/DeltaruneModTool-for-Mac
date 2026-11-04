@@ -5,11 +5,37 @@ import Foundation
 struct AppSettings: Codable {
     var windowsBackupPath: String
     var gameAppPath: String
+    var windowsSourcePath: String? = nil
+    var undertaleAppPath: String? = nil
+    var undertaleGameFolderPath: String? = nil
+    var undertaleBackupPath: String? = nil
+}
+
+enum ModGame: String, Codable, CaseIterable, Identifiable {
+    case deltarune
+    case undertale
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .deltarune: "DELTARUNE"
+        case .undertale: "UNDERTALE"
+        }
+    }
+
+    var gameBananaRow: String {
+        switch self {
+        case .deltarune: "6755"
+        case .undertale: "5506"
+        }
+    }
 }
 
 struct ModPayload: Codable, Hashable {
     var resourcePath: String
     var instanceFile: String
+    var sourceLabel: String? = nil
 }
 
 struct ModInstance: Codable, Identifiable {
@@ -22,6 +48,21 @@ struct ModInstance: Codable, Identifiable {
     var iconFile: String?
     var payloads: [ModPayload]
     var warnings: [String]
+    var skippedFiles: [ModSkippedFile]? = nil
+    var game: ModGame? = nil
+    var gameBananaModID: Int? = nil
+    var gameBananaFileID: Int? = nil
+    var gameBananaFileDateAdded: Int64? = nil
+
+    var targetGame: ModGame { game ?? .deltarune }
+}
+
+struct ModSkippedFile: Codable, Hashable, Identifiable {
+    let sourcePath: String
+    let targetPath: String
+    let macReplacementPath: String
+
+    var id: String { targetPath }
 }
 
 struct ModBuildResult {
@@ -29,32 +70,188 @@ struct ModBuildResult {
     var directory: URL
 }
 
+enum ModInstancePayloadMerger {
+    static func merge(_ build: ModBuildResult, into directory: URL) throws -> ModInstance {
+        let fileManager = FileManager.default
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        let current = try JSONDecoder().decode(ModInstance.self, from: Data(contentsOf: manifestURL))
+        let payloadRoot = directory.appendingPathComponent("Payloads", isDirectory: true)
+        try fileManager.createDirectory(at: payloadRoot, withIntermediateDirectories: true)
+        var updated = current
+        var copiedFiles: [URL] = []
+        var replacedFiles: [String] = []
+        do {
+            for payload in build.instance.payloads {
+                let source = try SafePaths.url(
+                    for: "Payloads/\(payload.instanceFile)",
+                    under: build.directory
+                )
+                let filename = UUID().uuidString
+                let destination = try SafePaths.url(for: filename, under: payloadRoot)
+                try fileManager.copyItem(at: source, to: destination)
+                copiedFiles.append(destination)
+                let installed = ModPayload(
+                    resourcePath: try SafePaths.relative(payload.resourcePath),
+                    instanceFile: filename,
+                    sourceLabel: payload.sourceLabel
+                )
+                replacedFiles.append(contentsOf: updated.payloads
+                    .filter { $0.resourcePath == installed.resourcePath }
+                    .map(\.instanceFile))
+                updated.payloads.removeAll { $0.resourcePath == installed.resourcePath }
+                updated.payloads.append(installed)
+            }
+            try JSONEncoder.pretty.encode(updated).write(to: manifestURL, options: .atomic)
+        } catch {
+            for file in copiedFiles {
+                try? fileManager.removeItem(at: file)
+            }
+            throw error
+        }
+        for filename in Set(replacedFiles) {
+            guard !updated.payloads.contains(where: { $0.instanceFile == filename }) else { continue }
+            do {
+                let oldFile = try SafePaths.url(for: filename, under: payloadRoot)
+                if fileManager.fileExists(atPath: oldFile.path) {
+                    try fileManager.removeItem(at: oldFile)
+                }
+            } catch {
+                NSLog("Could not remove replaced instance payload %@: %@", filename, error.localizedDescription)
+            }
+        }
+        return updated
+    }
+
+    static func replaceSkippedFile(
+        _ skippedFile: ModSkippedFile,
+        with replacementURL: URL,
+        in directory: URL
+    ) throws -> ModInstance {
+        guard replacementURL.pathExtension.lowercased() == "dylib" else {
+            throw ModManagerError.invalidArchive("Choose a macOS .dylib replacement.")
+        }
+        let fileManager = FileManager.default
+        let manifestURL = directory.appendingPathComponent("manifest.json")
+        var updated = try JSONDecoder().decode(ModInstance.self, from: Data(contentsOf: manifestURL))
+        guard let skippedFiles = updated.skippedFiles,
+              skippedFiles.contains(skippedFile) else {
+            throw ModManagerError.invalidArchive("This skipped file is no longer available for replacement.")
+        }
+
+        let cleanTarget = try SafePaths.relative(skippedFile.macReplacementPath)
+        let payloadRoot = directory.appendingPathComponent("Payloads", isDirectory: true)
+        try fileManager.createDirectory(at: payloadRoot, withIntermediateDirectories: true)
+        let filename = UUID().uuidString
+        let destination = try SafePaths.url(for: filename, under: payloadRoot)
+        try fileManager.copyItem(at: replacementURL, to: destination)
+
+        let oldPayloads = updated.payloads.filter { $0.resourcePath == cleanTarget }
+        updated.payloads.removeAll { $0.resourcePath == cleanTarget }
+        updated.payloads.append(ModPayload(
+            resourcePath: cleanTarget,
+            instanceFile: filename,
+            sourceLabel: "Mac replacement for \(skippedFile.targetPath)"
+        ))
+        updated.skippedFiles?.removeAll { $0 == skippedFile }
+        updated.warnings.removeAll {
+            $0 == "Skipped Windows-only or unsupported override: \(skippedFile.targetPath)"
+        }
+
+        do {
+            try JSONEncoder.pretty.encode(updated).write(to: manifestURL, options: .atomic)
+        } catch {
+            try? fileManager.removeItem(at: destination)
+            throw error
+        }
+
+        for payload in oldPayloads where !updated.payloads.contains(where: { $0.instanceFile == payload.instanceFile }) {
+            do {
+                let oldFile = try SafePaths.url(for: payload.instanceFile, under: payloadRoot)
+                if fileManager.fileExists(atPath: oldFile.path) {
+                    try fileManager.removeItem(at: oldFile)
+                }
+            } catch {
+                NSLog("Could not remove replaced instance payload %@: %@", payload.instanceFile, error.localizedDescription)
+            }
+        }
+        return updated
+    }
+}
+
+enum ManualPatchTarget: Hashable {
+    case launcher
+    case chapter(Int)
+    case undertale
+
+    var displayName: String {
+        switch self {
+        case .launcher:
+            "Launcher"
+        case .chapter(let number):
+            "Chapter \(number)"
+        case .undertale:
+            "Undertale data.win"
+        }
+    }
+}
+
 struct ManualPatchOption: Identifiable, Hashable {
     enum Kind: String, Hashable {
         case xdelta
         case dataWin
+        case dylib
     }
 
     let path: String
     var kind: Kind = .xdelta
     var id: String { path }
 
-    var suggestedChapter: Int? {
-        let pattern = #"(?:^|[^a-z0-9])(?:chapter|ch)[ _.-]*([1-5])(?:[^0-9]|$)"#
-        let expression = try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
-        let searchRange = NSRange(path.startIndex..., in: path)
-        guard let match = expression.firstMatch(in: path, range: searchRange),
-              let chapterRange = Range(match.range(at: 1), in: path) else {
-            return nil
+    var suggestsLauncher: Bool {
+        guard kind != .dylib else { return false }
+        if URL(fileURLWithPath: path).lastPathComponent.caseInsensitiveCompare("data.win") == .orderedSame,
+           suggestedChapter == nil {
+            return true
         }
-        return Int(path[chapterRange])
+        let expression = try! NSRegularExpression(
+            pattern: #"(?:^|[^a-z0-9])launcher(?:[^a-z0-9]|$)"#,
+            options: [.caseInsensitive]
+        )
+        return expression.firstMatch(in: path, range: NSRange(path.startIndex..., in: path)) != nil
+    }
+
+    var suggestedChapter: Int? {
+        let searchRange = NSRange(path.startIndex..., in: path)
+        let patterns: [(String, NSRegularExpression.Options)] = [
+            (#"(?:^|[^a-z0-9])(?:chapter|ch)[ _.-]*([1-5])(?:[^0-9]|$)"#, [.caseInsensitive]),
+            (#"(?:Chapter|Ch)[ _.-]*([1-5])(?:[^0-9]|$)"#, [])
+        ]
+        for (pattern, options) in patterns {
+            let expression = try! NSRegularExpression(pattern: pattern, options: options)
+            if let match = expression.firstMatch(in: path, range: searchRange),
+               let chapterRange = Range(match.range(at: 1), in: path) {
+                return Int(path[chapterRange])
+            }
+        }
+        return nil
     }
 }
 
 struct ManualPatchAssignment: Hashable {
     let patchPath: String
-    let chapter: Int
+    let target: ManualPatchTarget
     var kind: ManualPatchOption.Kind = .xdelta
+
+    init(patchPath: String, chapter: Int, kind: ManualPatchOption.Kind = .xdelta) {
+        self.patchPath = patchPath
+        self.target = .chapter(chapter)
+        self.kind = kind
+    }
+
+    init(patchPath: String, target: ManualPatchTarget, kind: ManualPatchOption.Kind = .xdelta) {
+        self.patchPath = patchPath
+        self.target = target
+        self.kind = kind
+    }
 }
 
 struct ManualPatchSelection: Identifiable {
@@ -63,6 +260,18 @@ struct ManualPatchSelection: Identifiable {
     let modName: String
     let options: [ManualPatchOption]
     let deleteAfterSuccess: Bool
+    var gameBananaIconURL: URL? = nil
+    var game: ModGame = .deltarune
+    var gameBananaModID: Int? = nil
+    var gameBananaFileID: Int? = nil
+    var gameBananaFileDateAdded: Int64? = nil
+    var updatingInstanceID: String? = nil
+}
+
+struct ModInstanceFileEntry: Identifiable, Hashable {
+    let path: String
+    let sourceLabel: String
+    var id: String { path }
 }
 
 struct PatchSpec {
@@ -80,6 +289,7 @@ enum ModArchiveKind: Equatable {
 
 enum ModManagerError: LocalizedError {
     case invalidWindowsFolder
+    case invalidUndertaleFolder
     case invalidGameApp
     case missingXdelta
     case invalidArchive(String)
@@ -96,6 +306,8 @@ enum ModManagerError: LocalizedError {
         switch self {
         case .invalidWindowsFolder:
             return "The selected folder does not contain any chapterN_windows/data.win files. Select the Windows DELTARUNE game folder, not the Mac Base DR folder."
+        case .invalidUndertaleFolder:
+            return "The selected folder does not contain Undertale's data.win file. Choose the Undertale game folder."
         case .invalidGameApp:
             return "The selected app does not contain Contents/Resources/chapterN_mac folders."
         case .missingXdelta:
@@ -173,6 +385,36 @@ enum SafePaths {
 }
 
 enum ModCustomFiles {
+    static func prepareMirroredDirectories(from resources: URL, at customRoot: URL) throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: customRoot, withIntermediateDirectories: true)
+        let standardizedRoot = customRoot.standardizedFileURL
+        let rootValues = try standardizedRoot.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
+        guard rootValues.isSymbolicLink != true, rootValues.isDirectory == true else {
+            throw ModManagerError.unsafePath(standardizedRoot.path)
+        }
+        guard let enumerator = fileManager.enumerator(
+            at: resources,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            throw CocoaError(.fileReadUnknown, userInfo: [NSFilePathErrorKey: resources.path])
+        }
+
+        let resourcesPath = resources.standardizedFileURL.path
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard values.isDirectory == true, values.isSymbolicLink != true else { continue }
+            let path = url.standardizedFileURL.path
+            guard path.hasPrefix(resourcesPath + "/") else {
+                throw ModManagerError.unsafePath(path)
+            }
+            let relative = try SafePaths.relative(String(path.dropFirst(resourcesPath.count + 1)))
+            let destination = try SafePaths.url(for: relative, under: standardizedRoot)
+            try fileManager.createDirectory(at: destination, withIntermediateDirectories: true)
+        }
+    }
+
     static func files(in root: URL) throws -> [String: URL] {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: root.path) else { return [:] }
@@ -269,6 +511,17 @@ enum WindowsBackup {
     }
 }
 
+enum UndertaleBackup {
+    static func backup(from folder: URL, to backupRoot: URL) throws {
+        let source = try GameAppLocator.undertaleDataFile(in: folder)
+        try FileManager.default.createDirectory(at: backupRoot, withIntermediateDirectories: true)
+        try FileManager.default.copyItem(
+            at: source,
+            to: backupRoot.appendingPathComponent("data.win")
+        )
+    }
+}
+
 enum GameAppLocator {
     static func resources(for appURL: URL) throws -> URL {
         let candidate: URL
@@ -297,6 +550,53 @@ enum GameAppLocator {
             common.appendingPathComponent("DELTARUNE.app", isDirectory: true)
         ]
         return candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) })
+    }
+
+    static func defaultUndertaleApp() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let common = home.appendingPathComponent(
+            "Library/Application Support/Steam/steamapps/common",
+            isDirectory: true
+        )
+        let candidates = [
+            common.appendingPathComponent("Undertale/UNDERTALE.app", isDirectory: true),
+            common.appendingPathComponent("Undertale/Undertale.app", isDirectory: true),
+            home.appendingPathComponent("Applications/Undertale.app", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Undertale.app", isDirectory: true)
+        ]
+        return candidates.first(where: {
+            (try? undertaleResources(for: $0)) != nil
+        })
+    }
+
+    static func undertaleResources(for appURL: URL) throws -> URL {
+        let resources = appURL.appendingPathComponent("Contents/Resources", isDirectory: true)
+        let gameFile = resources.appendingPathComponent("game.ios")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gameFile.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw ModManagerError.invalidGameApp
+        }
+        return resources.standardizedFileURL
+    }
+
+    static func defaultUndertaleFolder() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let folder = home.appendingPathComponent(
+            "Library/Application Support/Steam/steamapps/common/Undertale",
+            isDirectory: true
+        )
+        return (try? undertaleDataFile(in: folder)) == nil ? nil : folder
+    }
+
+    static func undertaleDataFile(in folder: URL) throws -> URL {
+        let dataFile = folder.appendingPathComponent("data.win")
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: dataFile.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw ModManagerError.invalidUndertaleFolder
+        }
+        return dataFile
     }
 }
 
@@ -438,6 +738,7 @@ enum DeltaModBuilder {
         try fileManager.createDirectory(at: payloadRoot, withIntermediateDirectories: true)
         var payloads: [ModPayload] = []
         var warnings: [String] = []
+        var skippedFiles: [ModSkippedFile] = []
         var emittedTargets = Set<String>()
 
         for spec in specs {
@@ -472,6 +773,13 @@ enum DeltaModBuilder {
             } else if spec.type.lowercased() == "override" {
                 guard let mapped = mapOverrideTarget(targetPath) else {
                     warnings.append("Skipped Windows-only or unsupported override: \(targetPath)")
+                    if let macPath = macReplacementPath(forWindowsTarget: targetPath) {
+                        skippedFiles.append(ModSkippedFile(
+                            sourcePath: patchPath,
+                            targetPath: targetPath,
+                            macReplacementPath: macPath
+                        ))
+                    }
                     continue
                 }
                 destinationPath = mapped
@@ -487,7 +795,7 @@ enum DeltaModBuilder {
             payloads.append(ModPayload(resourcePath: destinationPath, instanceFile: outputURL.lastPathComponent))
         }
 
-        guard !payloads.isEmpty else {
+        guard !payloads.isEmpty || !skippedFiles.isEmpty else {
             throw ModManagerError.invalidArchive("No Mac-compatible files were found.")
         }
 
@@ -515,7 +823,8 @@ enum DeltaModBuilder {
             authors: metadata.authors,
             iconFile: iconFile,
             payloads: payloads,
-            warnings: warnings
+            warnings: warnings,
+            skippedFiles: skippedFiles.isEmpty ? nil : skippedFiles
         )
         let manifestURL = finalDirectory.appendingPathComponent("manifest.json")
         let data = try JSONEncoder.pretty.encode(instance)
@@ -813,8 +1122,9 @@ enum DeltaModBuilder {
         archive: URL,
         supportRoot: URL
     ) throws -> [ManualPatchOption] {
-        if archive.pathExtension.lowercased() == "xdelta" {
-            return [ManualPatchOption(path: archive.lastPathComponent)]
+        if ["xdelta", "dylib"].contains(archive.pathExtension.lowercased()) {
+            let kind: ManualPatchOption.Kind = archive.pathExtension.lowercased() == "dylib" ? .dylib : .xdelta
+            return [ManualPatchOption(path: archive.lastPathComponent, kind: kind)]
         }
         let fileManager = FileManager.default
         let workDirectory = supportRoot.appendingPathComponent("Work-\(UUID().uuidString)", isDirectory: true)
@@ -837,6 +1147,8 @@ enum DeltaModBuilder {
                     return ManualPatchOption(path: path)
                 case "win" where url.lastPathComponent.caseInsensitiveCompare("data.win") == .orderedSame:
                     return ManualPatchOption(path: path, kind: .dataWin)
+                case "dylib":
+                    return ManualPatchOption(path: path, kind: .dylib)
                 default:
                     return nil
                 }
@@ -853,15 +1165,29 @@ enum DeltaModBuilder {
         assignments: [ManualPatchAssignment],
         modName: String,
         windowsBackup: URL,
-        supportRoot: URL
+        supportRoot: URL,
+        game: ModGame = .deltarune
     ) throws -> ModBuildResult {
         guard !assignments.isEmpty else {
             throw ModManagerError.missingManualPatch
         }
-        guard assignments.allSatisfy({ (1...5).contains($0.chapter) }),
-              Set(assignments.map(\.chapter)).count == assignments.count,
+        let gamePatches = assignments.filter { $0.kind != .dylib }
+        let hasValidTargets = assignments.allSatisfy { assignment in
+            switch assignment.target {
+            case .launcher:
+                game == .deltarune && assignment.kind != .dylib
+            case .chapter(let chapter):
+                game == .deltarune && (1...5).contains(chapter)
+            case .undertale:
+                game == .undertale && assignment.kind != .dylib
+            }
+        }
+        guard hasValidTargets,
+              Set(gamePatches.map(\.target)).count == gamePatches.count,
               Set(assignments.map(\.patchPath)).count == assignments.count else {
-            throw ModManagerError.unsupportedPatch("Each selected file must be assigned to a unique chapter.")
+            throw ModManagerError.unsupportedPatch(
+                "Each file must target one supported game data file; only one xdelta or data.win may target each game file."
+            )
         }
 
         let fileManager = FileManager.default
@@ -869,11 +1195,12 @@ enum DeltaModBuilder {
         try fileManager.createDirectory(at: workDirectory, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: workDirectory) }
 
+        let isStandaloneFile = ["xdelta", "dylib"].contains(archive.pathExtension.lowercased())
         let extracted = workDirectory.appendingPathComponent("Archive", isDirectory: true)
-        if archive.pathExtension.lowercased() != "xdelta" {
+        if !isStandaloneFile {
             try extract(archive, to: extracted)
         }
-        let languageFiles = archive.pathExtension.lowercased() == "xdelta"
+        let languageFiles = isStandaloneFile
             ? []
             : try findFiles(in: extracted).filter { isLanguageOverride($0.lastPathComponent) }
         let payloadRoot = workDirectory.appendingPathComponent("Payloads", isDirectory: true)
@@ -883,9 +1210,9 @@ enum DeltaModBuilder {
 
         for assignment in assignments {
             let patchURL: URL
-            if archive.pathExtension.lowercased() == "xdelta" {
+            if isStandaloneFile {
                 guard assignment.patchPath == archive.lastPathComponent else {
-                    throw ModManagerError.invalidArchive("The selected xdelta patch doesn't match the archive.")
+                    throw ModManagerError.invalidArchive("The selected file doesn't match the imported file.")
                 }
                 patchURL = archive
             } else {
@@ -893,41 +1220,79 @@ enum DeltaModBuilder {
                 patchURL = try findFile(path: patchPath, in: extracted)
             }
 
-            let sourceRelative = "chapter\(assignment.chapter)_windows/data.win"
-            let source = try SafePaths.url(for: sourceRelative, under: windowsBackup)
-            guard fileManager.fileExists(atPath: source.path) else {
-                throw ModManagerError.missingSource(sourceRelative)
-            }
-            let destinationPath = "chapter\(assignment.chapter)_mac/game.ios"
-            guard emittedTargets.insert(destinationPath).inserted else {
-                throw ModManagerError.unsupportedPatch("multiple patches target \(destinationPath)")
-            }
-            let output = payloadRoot.appendingPathComponent("Patched-\(assignment.chapter)-\(UUID().uuidString)")
+            let destinationPath: String
+            let output = payloadRoot.appendingPathComponent("Patched-\(UUID().uuidString)")
             switch assignment.kind {
             case .xdelta:
+                let sourceRelative: String
+                switch assignment.target {
+                case .launcher:
+                    sourceRelative = "data.win"
+                    destinationPath = "game.ios"
+                case .chapter(let chapter):
+                    sourceRelative = "chapter\(chapter)_windows/data.win"
+                    destinationPath = "chapter\(chapter)_mac/game.ios"
+                case .undertale:
+                    sourceRelative = "data.win"
+                    destinationPath = "game.ios"
+                }
+                let source = try SafePaths.url(for: sourceRelative, under: windowsBackup)
+                guard fileManager.fileExists(atPath: source.path) else {
+                    throw ModManagerError.missingSource(sourceRelative)
+                }
                 guard let xdelta = xdeltaExecutable() else {
                     throw ModManagerError.missingXdelta
                 }
                 try runXdelta(executable: xdelta, source: source, patch: patchURL, output: output)
             case .dataWin:
+                let sourceRelative: String
+                switch assignment.target {
+                case .launcher:
+                    sourceRelative = "data.win"
+                    destinationPath = "game.ios"
+                case .chapter(let chapter):
+                    sourceRelative = "chapter\(chapter)_windows/data.win"
+                    destinationPath = "chapter\(chapter)_mac/game.ios"
+                case .undertale:
+                    sourceRelative = "data.win"
+                    destinationPath = "game.ios"
+                }
+                let source = try SafePaths.url(for: sourceRelative, under: windowsBackup)
+                guard fileManager.fileExists(atPath: source.path) else {
+                    throw ModManagerError.missingSource(sourceRelative)
+                }
                 try fileManager.copyItem(at: patchURL, to: output)
+            case .dylib:
+                guard case .chapter(let chapter) = assignment.target, game == .deltarune else {
+                    throw ModManagerError.unsupportedPatch("A dylib must target a chapter, not the launcher.")
+                }
+                destinationPath = "chapter\(chapter)_mac/\(URL(fileURLWithPath: assignment.patchPath).lastPathComponent)"
+                _ = try SafePaths.relative(destinationPath)
+                try fileManager.copyItem(at: patchURL, to: output)
+            }
+            guard emittedTargets.insert(destinationPath).inserted else {
+                throw ModManagerError.unsupportedPatch("multiple files target \(destinationPath)")
             }
             manualPayloads.append(ModPayload(
                 resourcePath: destinationPath,
-                instanceFile: output.lastPathComponent
+                instanceFile: output.lastPathComponent,
+                sourceLabel: modName
             ))
 
-            for languageFile in languageFiles {
-                let languagePath = "chapter\(assignment.chapter)_mac/lang/\(languageFile.lastPathComponent)"
-                guard emittedTargets.insert(languagePath).inserted else {
-                    throw ModManagerError.unsupportedPatch("multiple files target \(languagePath)")
+            if case .chapter(let chapter) = assignment.target {
+                for languageFile in languageFiles where assignment.kind != .dylib {
+                    let languagePath = "chapter\(chapter)_mac/lang/\(languageFile.lastPathComponent)"
+                    guard emittedTargets.insert(languagePath).inserted else {
+                        throw ModManagerError.unsupportedPatch("multiple files target \(languagePath)")
+                    }
+                    let payloadURL = payloadRoot.appendingPathComponent("Override-\(UUID().uuidString)")
+                    try fileManager.copyItem(at: languageFile, to: payloadURL)
+                    manualPayloads.append(ModPayload(
+                        resourcePath: languagePath,
+                        instanceFile: payloadURL.lastPathComponent,
+                        sourceLabel: modName
+                    ))
                 }
-                let payloadURL = payloadRoot.appendingPathComponent("Override-\(UUID().uuidString)")
-                try fileManager.copyItem(at: languageFile, to: payloadURL)
-                manualPayloads.append(ModPayload(
-                    resourcePath: languagePath,
-                    instanceFile: payloadURL.lastPathComponent
-                ))
             }
         }
 
@@ -940,25 +1305,26 @@ enum DeltaModBuilder {
         try fileManager.moveItem(at: payloadRoot, to: finalPayloadRoot)
 
         var iconFile: String?
-        if archive.pathExtension.lowercased() != "xdelta",
+        if !isStandaloneFile,
            let icon = try? findFile(named: "_icon.png", in: extracted) {
             try fileManager.copyItem(at: icon, to: finalDirectory.appendingPathComponent("icon.png"))
             iconFile = "icon.png"
         }
 
-        let chapters = assignments.map(\.chapter).sorted().map(String.init).joined(separator: ", ")
+        let targets = assignments.map(\.target.displayName).sorted().joined(separator: ", ")
         let instance = ModInstance(
             id: id,
             name: modName,
             version: "",
             targetGameVersion: nil,
-            description: "Manual xdelta patches for chapter\(assignments.count == 1 ? "" : "s") \(chapters).",
+            description: "Manually imported files for \(targets).",
             authors: [],
             iconFile: iconFile,
             payloads: manualPayloads,
             warnings: assignments.map {
-                "Manually assigned \($0.patchPath) to Chapter \($0.chapter) as a \($0.kind == .dataWin ? "full data.win replacement" : "patch"); verify it matches that chapter."
-            }
+                "Manually assigned \($0.patchPath) to \($0.target.displayName) as a manually selected file; verify it matches that target."
+            },
+            game: game
         )
         try JSONEncoder.pretty.encode(instance)
             .write(to: finalDirectory.appendingPathComponent("manifest.json"), options: .atomic)
@@ -1146,28 +1512,53 @@ enum DeltaModBuilder {
     }
 
     private static func parseXML(_ url: URL) throws -> [PatchSpec] {
-        let delegate = ModXMLDelegate()
         let data = try Data(contentsOf: url)
         guard let contents = String(data: data, encoding: .utf8)
                 ?? String(data: data, encoding: .utf16) else {
             throw ModManagerError.invalidArchive("modding.xml must be UTF-8 or UTF-16 text.")
         }
-        let withoutDeclaration = contents.replacingOccurrences(
-            of: #"^\u{FEFF}?\s*<\?xml[^?]*\?>"#,
-            with: "",
+        let withoutDeclaration = removingXMLDeclaration(from: contents)
+        let contentsToParse = [withoutDeclaration, escapingBareAmpersands(in: withoutDeclaration)]
+        var lastFailure: (line: Int, column: Int, detail: String)?
+        for candidate in contentsToParse where lastFailure == nil || candidate != withoutDeclaration {
+            let delegate = ModXMLDelegate()
+            let fragment = Data("<modding>\(candidate)</modding>".utf8)
+            let parser = XMLParser(data: fragment)
+            parser.shouldResolveExternalEntities = false
+            parser.delegate = delegate
+            if parser.parse() {
+                return delegate.specs
+            }
+            lastFailure = (
+                line: max(1, parser.lineNumber - 1),
+                column: parser.columnNumber,
+                detail: parser.parserError?.localizedDescription ?? "unknown XML error"
+            )
+        }
+        let failure = lastFailure
+        throw ModManagerError.invalidArchive(
+            "modding.xml is invalid at line \(failure?.line ?? 1), column \(failure?.column ?? 1): \(failure?.detail ?? "unknown XML error")"
+        )
+    }
+
+    private static func escapingBareAmpersands(in text: String) -> String {
+        text.replacingOccurrences(
+            of: #"&(?!#(?:[0-9]+|[xX][0-9a-fA-F]+);|amp;|lt;|gt;|quot;|apos;)"#,
+            with: "&amp;",
             options: .regularExpression
         )
-        let fragment = Data("<modding>\(withoutDeclaration)</modding>".utf8)
-        let parser = XMLParser(data: fragment)
-        parser.shouldResolveExternalEntities = false
-        parser.delegate = delegate
-        guard parser.parse() else {
-            let line = parser.lineNumber
-            let column = parser.columnNumber
-            let detail = parser.parserError?.localizedDescription ?? "unknown XML error"
-            throw ModManagerError.invalidArchive("modding.xml is invalid at line \(line), column \(column): \(detail)")
+    }
+
+    private static func removingXMLDeclaration(from contents: String) -> String {
+        let withoutLeadingWhitespace = contents.drop(while: { $0.isWhitespace || $0 == "\u{FEFF}" })
+        var result = String(withoutLeadingWhitespace)
+        guard result.hasPrefix("<?xml"),
+              result.dropFirst(5).first?.isWhitespace == true,
+              let declarationEnd = result.range(of: "?>") else {
+            return result
         }
-        return delegate.specs
+        result.removeSubrange(result.startIndex..<declarationEnd.upperBound)
+        return result
     }
 
     private static func chapterNumber(fromWindowsTarget target: String) throws -> Int {
@@ -1194,6 +1585,22 @@ enum DeltaModBuilder {
             return "game.ios"
         }
         return nil
+    }
+
+    private static func macReplacementPath(forWindowsTarget target: String) -> String? {
+        guard target.range(
+            of: #"^chapter[1-5]_windows/.+\.dll$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil else {
+            return nil
+        }
+        let chapterPath = target.replacingOccurrences(
+            of: "_windows/",
+            with: "_mac/",
+            options: [.caseInsensitive]
+        )
+        let dylibPath = (chapterPath as NSString).deletingPathExtension + ".dylib"
+        return try? SafePaths.relative(dylibPath)
     }
 
     private static func runXdelta(executable: URL, source: URL, patch: URL, output: URL) throws {

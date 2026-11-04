@@ -7,6 +7,7 @@ private struct ActiveRunJournal: Codable {
     var resourcePath: String
     var backupDirectory: String
     var files: [ActiveRunFile]
+    var game: ModGame? = nil
 }
 
 private struct ActiveRunFile: Codable {
@@ -25,11 +26,15 @@ final class AppModel: ObservableObject {
     @Published var setupWindowsFolder: URL?
     @Published var setupGameApp: URL?
     @Published var manualPatchSelection: ManualPatchSelection?
+    @Published var isCheckingForUpdates = false
+    @Published private(set) var availableModUpdates: [String: GameBananaFile] = [:]
+    @Published private(set) var isCheckingModUpdates = false
 
     private var runTimer: Timer?
     private var launchedProcessID: pid_t?
     private var appTerminationObserver: NSObjectProtocol?
     private var isRestoringRun = false
+    private var launchedGame: ModGame = .deltarune
 
     init() {
         try? FileManager.default.createDirectory(at: AppPaths.support, withIntermediateDirectories: true)
@@ -51,7 +56,8 @@ final class AppModel: ObservableObject {
                       self.launchedProcessID == app.processIdentifier else {
                     return
                 }
-                if !Self.gameIsRunning(at: URL(fileURLWithPath: self.settings?.gameAppPath ?? "")) {
+                let game = self.launchedGame
+                if !Self.gameIsRunning(at: self.gameAppURL(for: game), game: game) {
                     self.restoreAfterGameExit()
                 }
             }
@@ -79,7 +85,11 @@ final class AppModel: ObservableObject {
                 let resources = try GameAppLocator.resources(for: gameApp)
                 let backup = supportRoot.appendingPathComponent("WindowsBackup", isDirectory: true)
                 try WindowsBackup.backup(from: windowsFolder, to: backup)
-                let settings = AppSettings(windowsBackupPath: backup.path, gameAppPath: gameApp.path)
+                let settings = AppSettings(
+                    windowsBackupPath: backup.path,
+                    gameAppPath: gameApp.path,
+                    windowsSourcePath: windowsFolder.path
+                )
                 let data = try JSONEncoder.pretty.encode(settings)
                 try data.write(to: AppPaths.settings, options: .atomic)
                 DispatchQueue.main.async {
@@ -97,6 +107,530 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func updateGameApp(to gameApp: URL) {
+        guard !isBusy else { return }
+        guard let current = settings else {
+            errorMessage = "Complete setup before changing the game app."
+            return
+        }
+        guard !Self.gameIsRunning(at: URL(fileURLWithPath: current.gameAppPath)) else {
+            errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: Self.journalURL.path) else {
+            errorMessage = ModManagerError.activeRun.localizedDescription
+            return
+        }
+        do {
+            _ = try GameAppLocator.resources(for: gameApp)
+            var updated = current
+            updated.gameAppPath = gameApp.path
+            try JSONEncoder.pretty.encode(updated).write(to: AppPaths.settings, options: .atomic)
+            settings = updated
+            setupGameApp = gameApp
+            statusMessage = "Updated Mac game app location."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func updateWindowsBackup(from windowsFolder: URL) {
+        guard !isBusy else { return }
+        guard let current = settings else {
+            errorMessage = "Complete setup before changing the Windows backup."
+            return
+        }
+        guard !Self.gameIsRunning(at: URL(fileURLWithPath: current.gameAppPath)) else {
+            errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: Self.journalURL.path) else {
+            errorMessage = ModManagerError.activeRun.localizedDescription
+            return
+        }
+
+        let supportRoot = AppPaths.support
+        let newBackup = supportRoot.appendingPathComponent(
+            "WindowsBackup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        isBusy = true
+        statusMessage = "Backing up Windows chapter data..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try WindowsBackup.backup(from: windowsFolder, to: newBackup)
+                var updated = current
+                updated.windowsBackupPath = newBackup.path
+                updated.windowsSourcePath = windowsFolder.path
+                try JSONEncoder.pretty.encode(updated).write(to: AppPaths.settings, options: .atomic)
+                DispatchQueue.main.async {
+                    self.settings = updated
+                    self.statusMessage = "Windows game files backed up."
+                    self.isBusy = false
+                    Self.removePreviousWindowsBackup(at: URL(fileURLWithPath: current.windowsBackupPath))
+                }
+            } catch {
+                do {
+                    if FileManager.default.fileExists(atPath: newBackup.path) {
+                        try FileManager.default.removeItem(at: newBackup)
+                    }
+                } catch {
+                    NSLog("Could not remove incomplete Windows backup %@: %@", newBackup.path, error.localizedDescription)
+                }
+                DispatchQueue.main.async {
+                    self.errorMessage = error.localizedDescription
+                    self.statusMessage = ""
+                    self.isBusy = false
+                }
+            }
+        }
+    }
+
+    func showWindowsBackupInFinder() {
+        guard let settings else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([
+            URL(fileURLWithPath: settings.windowsBackupPath, isDirectory: true)
+        ])
+    }
+
+    func configureUndertale(app: URL, folder: URL) {
+        guard !isBusy else { return }
+        guard let current = settings else {
+            errorMessage = "Complete DELTARUNE setup before configuring Undertale."
+            return
+        }
+        guard app.pathExtension.lowercased() == "app",
+              (try? GameAppLocator.undertaleResources(for: app)) != nil else {
+            errorMessage = "Choose the Steam-installed Undertale.app containing Contents/Resources/game.ios."
+            return
+        }
+        guard !Self.gameIsRunning(at: app, game: .undertale) else {
+            errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: Self.journalURL.path) else {
+            errorMessage = ModManagerError.activeRun.localizedDescription
+            return
+        }
+
+        let backup = AppPaths.support.appendingPathComponent(
+            "UndertaleBackup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        isBusy = true
+        statusMessage = "Backing up the Windows Undertale data.win source..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try UndertaleBackup.backup(from: folder, to: backup)
+                var updated = current
+                updated.undertaleAppPath = app.path
+                updated.undertaleGameFolderPath = folder.path
+                updated.undertaleBackupPath = backup.path
+                try JSONEncoder.pretty.encode(updated).write(to: AppPaths.settings, options: .atomic)
+                DispatchQueue.main.async {
+                    self.settings = updated
+                    self.statusMessage = "Windows Undertale data.win source backed up."
+                    self.isBusy = false
+                    if let previous = current.undertaleBackupPath {
+                        Self.removeManagedBackup(at: URL(fileURLWithPath: previous), prefix: "UndertaleBackup")
+                    }
+                }
+            } catch {
+                do {
+                    if FileManager.default.fileExists(atPath: backup.path) {
+                        try FileManager.default.removeItem(at: backup)
+                    }
+                } catch {
+                    NSLog("Could not remove incomplete Undertale backup %@: %@", backup.path, error.localizedDescription)
+                }
+                DispatchQueue.main.async {
+                    self.errorMessage = error.localizedDescription
+                    self.statusMessage = ""
+                    self.isBusy = false
+                }
+            }
+        }
+    }
+
+    func updateUndertaleApp(to app: URL) {
+        guard !isBusy else { return }
+        guard app.pathExtension.lowercased() == "app",
+              (try? GameAppLocator.undertaleResources(for: app)) != nil else {
+            errorMessage = "Choose the Steam-installed Undertale.app containing Contents/Resources/game.ios."
+            return
+        }
+        guard var updated = settings else {
+            errorMessage = "Complete DELTARUNE setup before configuring Undertale."
+            return
+        }
+        guard !Self.gameIsRunning(
+            at: URL(fileURLWithPath: updated.undertaleAppPath ?? app.path),
+            game: .undertale
+        ) else {
+            errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: Self.journalURL.path) else {
+            errorMessage = ModManagerError.activeRun.localizedDescription
+            return
+        }
+        updated.undertaleAppPath = app.path
+        do {
+            try JSONEncoder.pretty.encode(updated).write(to: AppPaths.settings, options: .atomic)
+            settings = updated
+            statusMessage = "Updated Undertale Mac game app."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func isConfigured(for game: ModGame) -> Bool {
+        guard let settings else { return false }
+        switch game {
+        case .deltarune:
+            return true
+        case .undertale:
+            guard let app = settings.undertaleAppPath,
+                  let folder = settings.undertaleGameFolderPath,
+                  let backup = settings.undertaleBackupPath else {
+                return false
+            }
+            return (try? GameAppLocator.undertaleResources(for: URL(fileURLWithPath: app))) != nil &&
+                FileManager.default.fileExists(atPath: URL(fileURLWithPath: folder).appendingPathComponent("data.win").path) &&
+                FileManager.default.fileExists(atPath: URL(fileURLWithPath: backup).appendingPathComponent("data.win").path)
+        }
+    }
+
+    private func backupPath(for game: ModGame, settings: AppSettings) -> String? {
+        switch game {
+        case .deltarune:
+            settings.windowsBackupPath
+        case .undertale:
+            settings.undertaleBackupPath
+        }
+    }
+
+    private func gameAppURL(for game: ModGame) -> URL {
+        let path: String
+        switch game {
+        case .deltarune:
+            path = settings?.gameAppPath ?? ""
+        case .undertale:
+            path = settings?.undertaleAppPath ?? ""
+        }
+        return URL(fileURLWithPath: path)
+    }
+
+    func checkForUpdates() {
+        guard !isBusy, !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        statusMessage = "Checking for updates..."
+        Task {
+            defer { isCheckingForUpdates = false }
+            do {
+                let release = try await AppUpdateService.latestRelease()
+                let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.3"
+                if AppUpdateService.isNewer(release.tagName, than: currentVersion) {
+                    statusMessage = "Version \(release.tagName) is available. Opening the release download page..."
+                    guard NSWorkspace.shared.open(release.htmlURL) else {
+                        throw AppUpdateError.badResponse
+                    }
+                } else {
+                    statusMessage = "You're up to date (version \(currentVersion))."
+                }
+            } catch {
+                statusMessage = ""
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func checkForModUpdates(catalog: GameBananaCatalog) {
+        guard !isCheckingModUpdates, !isBusy else { return }
+        isCheckingModUpdates = true
+        availableModUpdates = [:]
+        Task {
+            defer { isCheckingModUpdates = false }
+            var failure: String?
+            for instance in instances {
+                guard let modID = instance.gameBananaModID,
+                      let installedFileID = instance.gameBananaFileID else {
+                    continue
+                }
+                do {
+                    let details = try await catalog.details(forModID: modID)
+                    let latest = details.files
+                        .filter(\.isSupportedRelease)
+                        .sorted { ($0.dateAdded ?? 0) > ($1.dateAdded ?? 0) }
+                        .first
+                    guard let latest,
+                          latest.id != installedFileID,
+                          instance.gameBananaFileDateAdded == nil ||
+                            (latest.dateAdded ?? 0) > (instance.gameBananaFileDateAdded ?? 0) else {
+                        continue
+                    }
+                    availableModUpdates[instance.id] = latest
+                } catch {
+                    failure = "Couldn't check for updates to \(instance.name): \(GameBananaError.message(for: error))"
+                }
+            }
+            if let failure {
+                errorMessage = failure
+            }
+        }
+    }
+
+    func updateMod(_ instance: ModInstance, using file: GameBananaFile, catalog: GameBananaCatalog) {
+        guard !isBusy else { return }
+        guard let current = instances.first(where: { $0.id == instance.id }),
+              let modID = current.gameBananaModID,
+              let settings,
+              let backupPath = backupPath(for: current.targetGame, settings: settings) else {
+            errorMessage = "This mod update is no longer available or its game backup is missing."
+            return
+        }
+        isBusy = true
+        statusMessage = "Updating \(current.name)..."
+        Task {
+            do {
+                let updated = try await buildAndReplaceInstance(
+                    current,
+                    modID: modID,
+                    file: file,
+                    backupPath: backupPath,
+                    catalog: catalog
+                )
+                if let index = instances.firstIndex(where: { $0.id == updated.id }) {
+                    instances[index] = updated
+                }
+                availableModUpdates.removeValue(forKey: updated.id)
+                isBusy = false
+                statusMessage = "Updated \(updated.name) to \(file.releaseTitle)."
+            } catch {
+                isBusy = false
+                statusMessage = ""
+                errorMessage = "Couldn't update \(current.name): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func updateAllMods(catalog: GameBananaCatalog) {
+        guard !isBusy else { return }
+        let pending = instances.compactMap { instance -> (ModInstance, GameBananaFile)? in
+            guard let file = availableModUpdates[instance.id] else { return nil }
+            return (instance, file)
+        }
+        guard !pending.isEmpty else { return }
+        guard let settings else {
+            errorMessage = "Complete setup before updating mods."
+            return
+        }
+        isBusy = true
+        Task {
+            var updatedCount = 0
+            var failures: [String] = []
+            for (instance, file) in pending {
+                guard let modID = instance.gameBananaModID,
+                      let backupPath = backupPath(for: instance.targetGame, settings: settings) else {
+                    failures.append("\(instance.name): missing GameBanana source or backup.")
+                    continue
+                }
+                statusMessage = "Updating \(instance.name)..."
+                do {
+                    let updated = try await buildAndReplaceInstance(
+                        instance,
+                        modID: modID,
+                        file: file,
+                        backupPath: backupPath,
+                        catalog: catalog
+                    )
+                    if let index = instances.firstIndex(where: { $0.id == updated.id }) {
+                        instances[index] = updated
+                    }
+                    availableModUpdates.removeValue(forKey: updated.id)
+                    updatedCount += 1
+                } catch {
+                    failures.append("\(instance.name): \(error.localizedDescription)")
+                }
+            }
+            isBusy = false
+            if failures.isEmpty {
+                statusMessage = "Updated \(updatedCount) mod\(updatedCount == 1 ? "" : "s")."
+            } else {
+                statusMessage = "Updated \(updatedCount) mod\(updatedCount == 1 ? "" : "s"); some updates failed."
+                errorMessage = failures.joined(separator: "\n")
+            }
+        }
+    }
+
+    private func buildAndReplaceInstance(
+        _ instance: ModInstance,
+        modID: Int,
+        file: GameBananaFile,
+        backupPath: String,
+        catalog: GameBananaCatalog
+    ) async throws -> ModInstance {
+        let details = try await catalog.details(forModID: modID)
+        let archive = try await GameBananaCatalog.download(file)
+        defer {
+            if let warning = Self.removeDownloadedArchive(archive) {
+                NSLog("GameBanana update download cleanup failed: %@", warning)
+            }
+        }
+        let kind = try await Task.detached(priority: .userInitiated) {
+            try DeltaModBuilder.archiveKind(archive)
+        }.value
+        let result: ModBuildResult
+        if instance.targetGame == .deltarune, kind != .other {
+            result = try await Task.detached(priority: .userInitiated) {
+                try DeltaModBuilder.build(
+                    archive: archive,
+                    windowsBackup: URL(fileURLWithPath: backupPath),
+                    supportRoot: AppPaths.support
+                )
+            }.value
+        } else {
+            let options = try await Task.detached(priority: .userInitiated) {
+                try DeltaModBuilder.manualPatchOptions(archive: archive, supportRoot: AppPaths.support)
+            }.value
+            let assignments = try Self.updateAssignments(for: options, instance: instance)
+            result = try await Task.detached(priority: .userInitiated) {
+                try DeltaModBuilder.buildManual(
+                    archive: archive,
+                    assignments: assignments,
+                    modName: details.name,
+                    windowsBackup: URL(fileURLWithPath: backupPath),
+                    supportRoot: AppPaths.support,
+                    game: instance.targetGame
+                )
+            }.value
+        }
+        var updated = result.instance
+        updated.id = instance.id
+        updated.name = instance.name
+        updated.game = instance.targetGame
+        updated.gameBananaModID = modID
+        updated.gameBananaFileID = file.id
+        updated.gameBananaFileDateAdded = file.dateAdded
+        updated = await addingGameBananaIconIfNeeded(
+            to: ModBuildResult(instance: updated, directory: result.directory),
+            from: details.imageURL
+        ).instance
+        do {
+            return try await Task.detached(priority: .userInitiated) {
+                try Self.replaceUpdatedInstance(
+                    instance,
+                    with: ModBuildResult(instance: updated, directory: result.directory)
+                )
+            }.value
+        } catch {
+            if FileManager.default.fileExists(atPath: result.directory.path) {
+                do {
+                    try FileManager.default.removeItem(at: result.directory)
+                } catch {
+                    NSLog("Could not remove failed update build %@: %@", result.directory.path, error.localizedDescription)
+                }
+            }
+            throw error
+        }
+    }
+
+    nonisolated private static func updateAssignments(
+        for options: [ManualPatchOption],
+        instance: ModInstance
+    ) throws -> [ManualPatchAssignment] {
+        guard !options.isEmpty else { throw ModManagerError.missingManualPatch }
+        var assignments: [ManualPatchAssignment] = []
+        for option in options {
+            let target: ManualPatchTarget?
+            if instance.targetGame == .undertale {
+                target = options.count == 1 && option.kind != .dylib ? .undertale : nil
+            } else if option.suggestsLauncher {
+                target = .launcher
+            } else if let chapter = option.suggestedChapter {
+                target = .chapter(chapter)
+            } else {
+                let dataTargets = instance.payloads.compactMap { payload -> ManualPatchTarget? in
+                    if payload.resourcePath == "game.ios" { return .launcher }
+                    guard let match = payload.resourcePath.range(
+                        of: #"^chapter([1-5])_mac/game\.ios$"#,
+                        options: .regularExpression
+                    ) else { return nil }
+                    let chapterText = payload.resourcePath[match]
+                        .dropFirst("chapter".count)
+                        .prefix(1)
+                    return Int(chapterText).map(ManualPatchTarget.chapter)
+                }
+                target = dataTargets.count == 1 ? dataTargets[0] : nil
+            }
+            guard let target, option.kind != .dylib else {
+                throw ModManagerError.unsupportedPatch(
+                    "The update release doesn't identify a safe game-data target for \(option.path)."
+                )
+            }
+            assignments.append(ManualPatchAssignment(
+                patchPath: option.path,
+                target: target,
+                kind: option.kind
+            ))
+        }
+        return assignments
+    }
+
+    nonisolated private static func replaceUpdatedInstance(
+        _ current: ModInstance,
+        with build: ModBuildResult
+    ) throws -> ModInstance {
+        let fileManager = FileManager.default
+        let oldDirectory = AppPaths.instanceDirectory(current.id)
+        let customRoot = oldDirectory.appendingPathComponent("CustomFiles", isDirectory: true)
+        let customFiles = try ModCustomFiles.files(in: customRoot)
+        for (relativePath, source) in customFiles {
+            let destination = try SafePaths.url(
+                for: "CustomFiles/\(relativePath)",
+                under: build.directory
+            )
+            try fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try fileManager.copyItem(at: source, to: destination)
+        }
+        if build.instance.iconFile == nil, let oldIcon = current.iconFile {
+            let source = try SafePaths.url(for: oldIcon, under: oldDirectory)
+            let destination = build.directory.appendingPathComponent(oldIcon)
+            if fileManager.fileExists(atPath: source.path) {
+                try fileManager.copyItem(at: source, to: destination)
+            }
+        }
+        try JSONEncoder.pretty.encode(build.instance)
+            .write(to: build.directory.appendingPathComponent("manifest.json"), options: .atomic)
+
+        let backupDirectory = AppPaths.instances.appendingPathComponent(
+            ".UpdateBackup-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try fileManager.moveItem(at: oldDirectory, to: backupDirectory)
+        do {
+            try fileManager.moveItem(at: build.directory, to: oldDirectory)
+        } catch {
+            do {
+                try fileManager.moveItem(at: backupDirectory, to: oldDirectory)
+            } catch {
+                throw ModManagerError.launchRollbackFailed(
+                    "The update failed and the previous instance could not be restored: \(error.localizedDescription)"
+                )
+            }
+            throw error
+        }
+        do {
+            try fileManager.removeItem(at: backupDirectory)
+        } catch {
+            NSLog("Could not remove prior instance backup %@: %@", backupDirectory.path, error.localizedDescription)
+        }
+        return build.instance
     }
 
     func installArchive(_ archive: URL, deleteAfterSuccess: Bool = false) {
@@ -131,8 +665,17 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func analyzeManualArchive(_ archive: URL, modName: String, deleteAfterSuccess: Bool = false) {
+    func analyzeManualArchive(
+        _ archive: URL,
+        modName: String,
+        deleteAfterSuccess: Bool = false,
+        game: ModGame = .deltarune
+    ) {
         guard !isBusy else { return }
+        guard isConfigured(for: game) else {
+            errorMessage = "Configure \(game.title) in Settings before installing a mod."
+            return
+        }
         isBusy = true
         statusMessage = "Finding xdelta patches..."
         Task {
@@ -140,13 +683,26 @@ final class AppModel: ObservableObject {
                 let options = try await Task.detached(priority: .userInitiated) {
                     try DeltaModBuilder.manualPatchOptions(archive: archive, supportRoot: AppPaths.support)
                 }.value
+                if installSingleUndertaleXdeltaIfPossible(
+                    options,
+                    archive: archive,
+                    game: game,
+                    modName: modName,
+                    deleteAfterSuccess: deleteAfterSuccess
+                ) {
+                    return
+                }
                 manualPatchSelection = ManualPatchSelection(
                     archive: archive,
                     modName: modName,
                     options: options,
-                    deleteAfterSuccess: deleteAfterSuccess
+                    deleteAfterSuccess: deleteAfterSuccess,
+                    game: game,
+                    updatingInstanceID: nil
                 )
-                statusMessage = "Choose a chapter for each patch to include."
+                statusMessage = game == .undertale
+                    ? "Choose which Undertale files to include."
+                    : "Choose a chapter for each patch to include."
                 isBusy = false
             } catch {
                 isBusy = false
@@ -157,8 +713,34 @@ final class AppModel: ObservableObject {
     }
 
     func installManualArchive(_ selection: ManualPatchSelection, assignments: [ManualPatchAssignment]) {
+        installManualArchive(selection, assignments: assignments, modName: selection.modName)
+    }
+
+    func inspectManualArchive(_ archive: URL, game: ModGame = .deltarune) async throws -> ManualPatchSelection {
+        let options = try await Task.detached(priority: .userInitiated) {
+            try DeltaModBuilder.manualPatchOptions(archive: archive, supportRoot: AppPaths.support)
+        }.value
+        return ManualPatchSelection(
+            archive: archive,
+            modName: archive.deletingPathExtension().lastPathComponent,
+            options: options,
+            deleteAfterSuccess: false,
+            game: game
+        )
+    }
+
+    func installManualArchive(
+        _ selection: ManualPatchSelection,
+        assignments: [ManualPatchAssignment],
+        modName: String
+    ) {
         guard let settings else {
             errorMessage = "Complete setup before installing a manual patch."
+            return
+        }
+        guard isConfigured(for: selection.game),
+              let backupPath = backupPath(for: selection.game, settings: settings) else {
+            errorMessage = "Configure \(selection.game.title) in Settings before installing a mod."
             return
         }
         guard !isBusy else { return }
@@ -171,18 +753,178 @@ final class AppModel: ObservableObject {
                     try DeltaModBuilder.buildManual(
                         archive: selection.archive,
                         assignments: assignments,
-                        modName: selection.modName,
-                        windowsBackup: URL(fileURLWithPath: settings.windowsBackupPath),
-                        supportRoot: AppPaths.support
+                        modName: modName,
+                        windowsBackup: URL(fileURLWithPath: backupPath),
+                        supportRoot: AppPaths.support,
+                        game: selection.game
                     )
                 }.value
+                let (installedInstance, iconWarning) = await addingGameBananaIconIfNeeded(
+                    to: result,
+                    from: selection.gameBananaIconURL
+                )
+                var installed = installedInstance
+                installed.gameBananaModID = selection.gameBananaModID
+                installed.gameBananaFileID = selection.gameBananaFileID
+                installed.gameBananaFileDateAdded = selection.gameBananaFileDateAdded
+                try JSONEncoder.pretty.encode(installed)
+                    .write(to: result.directory.appendingPathComponent("manifest.json"), options: .atomic)
                 let cleanupMessage = selection.deleteAfterSuccess
                     ? Self.removeDownloadedArchive(selection.archive)
                     : nil
-                instances.insert(result.instance, at: 0)
+                if let updatingID = selection.updatingInstanceID,
+                   let existing = instances.first(where: { $0.id == updatingID }) {
+                    let updated = try Self.replaceUpdatedInstance(
+                        existing,
+                        with: ModBuildResult(instance: installed, directory: result.directory)
+                    )
+                    guard let index = instances.firstIndex(where: { $0.id == updatingID }) else {
+                        throw ModManagerError.invalidArchive("The mod instance being updated was removed.")
+                    }
+                    instances[index] = updated
+                } else {
+                    instances.insert(installed, at: 0)
+                }
                 isBusy = false
-                statusMessage = "Created instance: \(result.instance.name)" +
+                statusMessage = (selection.updatingInstanceID == nil ? "Created instance: " : "Updated instance: ") +
+                    installed.name +
+                    (iconWarning.map { " (\($0))" } ?? "") +
                     (cleanupMessage.map { " (\($0))" } ?? "")
+            } catch {
+                isBusy = false
+                statusMessage = ""
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func installSingleUndertaleXdeltaIfPossible(
+        _ options: [ManualPatchOption],
+        archive: URL,
+        game: ModGame,
+        modName: String,
+        deleteAfterSuccess: Bool,
+        gameBananaIconURL: URL? = nil,
+        gameBananaModID: Int? = nil,
+        gameBananaFileID: Int? = nil,
+        gameBananaFileDateAdded: Int64? = nil
+    ) -> Bool {
+        guard game == .undertale,
+              options.count == 1,
+              options[0].kind == .xdelta else {
+            return false
+        }
+        let selection = ManualPatchSelection(
+            archive: archive,
+            modName: modName,
+            options: options,
+            deleteAfterSuccess: deleteAfterSuccess,
+            gameBananaIconURL: gameBananaIconURL,
+            game: .undertale,
+            gameBananaModID: gameBananaModID,
+            gameBananaFileID: gameBananaFileID,
+            gameBananaFileDateAdded: gameBananaFileDateAdded
+        )
+        isBusy = false
+        installManualArchive(
+            selection,
+            assignments: [
+                ManualPatchAssignment(
+                    patchPath: options[0].path,
+                    target: .undertale,
+                    kind: .xdelta
+                )
+            ],
+            modName: modName
+        )
+        return true
+    }
+
+    func addManualArchive(
+        _ selection: ManualPatchSelection,
+        assignments: [ManualPatchAssignment],
+        named modName: String,
+        to instance: ModInstance
+    ) {
+        guard let settings else {
+            errorMessage = "Complete setup before editing a mod instance."
+            return
+        }
+        guard let backupPath = backupPath(for: instance.targetGame, settings: settings) else {
+            errorMessage = "The backup for \(instance.targetGame.title) is not configured."
+            return
+        }
+        guard !isBusy else { return }
+        let cleanName = modName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else {
+            errorMessage = "Enter a name for these files."
+            return
+        }
+        isBusy = true
+        statusMessage = "Adding files to \(instance.name)..."
+        Task {
+            var result: ModBuildResult?
+            do {
+                let built = try await Task.detached(priority: .userInitiated) {
+                    try DeltaModBuilder.buildManual(
+                        archive: selection.archive,
+                        assignments: assignments,
+                        modName: cleanName,
+                        windowsBackup: URL(fileURLWithPath: backupPath),
+                        supportRoot: AppPaths.support,
+                        game: instance.targetGame
+                    )
+                }.value
+                result = built
+                let updated = try await Task.detached(priority: .userInitiated) {
+                    try ModInstancePayloadMerger.merge(
+                        built,
+                        into: AppPaths.instanceDirectory(instance.id)
+                    )
+                }.value
+                if let index = instances.firstIndex(where: { $0.id == instance.id }) {
+                    instances[index] = updated
+                }
+                statusMessage = "Added \(cleanName) to \(instance.name)."
+                isBusy = false
+                do {
+                    try FileManager.default.removeItem(at: built.directory)
+                } catch {
+                    errorMessage = "Files were added, but temporary files could not be removed: \(error.localizedDescription)"
+                }
+            } catch {
+                if let result {
+                    try? FileManager.default.removeItem(at: result.directory)
+                }
+                isBusy = false
+                statusMessage = ""
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func replaceSkippedFile(_ skippedFile: ModSkippedFile, with dylibURL: URL, in instance: ModInstance) {
+        guard !isBusy else { return }
+        guard let current = instances.first(where: { $0.id == instance.id }) else {
+            errorMessage = "This mod instance is no longer available."
+            return
+        }
+        isBusy = true
+        statusMessage = "Repatching \(current.name) with \(dylibURL.lastPathComponent)..."
+        Task {
+            do {
+                let updated = try await Task.detached(priority: .userInitiated) {
+                    try ModInstancePayloadMerger.replaceSkippedFile(
+                        skippedFile,
+                        with: dylibURL,
+                        in: AppPaths.instanceDirectory(current.id)
+                    )
+                }.value
+                if let index = instances.firstIndex(where: { $0.id == current.id }) {
+                    instances[index] = updated
+                }
+                isBusy = false
+                statusMessage = "Repatched \(current.name). The Mac replacement will be applied the next time you launch this instance."
             } catch {
                 isBusy = false
                 statusMessage = ""
@@ -230,7 +972,13 @@ final class AppModel: ObservableObject {
                     throw GameBananaError.unsupportedDownload
                 }
                 isBusy = false
-                downloadAndInstall(file, modName: details.name)
+                downloadAndInstall(
+                    file,
+                    modName: details.name,
+                    gameBananaIconURL: details.imageURL,
+                    game: catalog.game,
+                    gameBananaModID: link.modID
+                )
             } catch {
                 isBusy = false
                 statusMessage = ""
@@ -239,7 +987,13 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func downloadAndInstall(_ file: GameBananaFile, modName: String) {
+    func downloadAndInstall(
+        _ file: GameBananaFile,
+        modName: String,
+        gameBananaIconURL: URL? = nil,
+        game: ModGame = .deltarune,
+        gameBananaModID: Int? = nil
+    ) {
         guard !isBusy else { return }
         guard file.isSelectableRelease else {
             errorMessage = "This release isn't a supported Deltamod, G3M ZIP, or manual patch."
@@ -249,24 +1003,50 @@ final class AppModel: ObservableObject {
             errorMessage = "Complete setup before installing a mod."
             return
         }
+        guard isConfigured(for: game),
+              backupPath(for: game, settings: settings) != nil else {
+            errorMessage = "Configure \(game.title) in Settings before installing a mod."
+            return
+        }
         isBusy = true
         statusMessage = "Downloading \(file.name) from GameBanana..."
         Task {
             do {
                 let archive = try await GameBananaCatalog.download(file)
                 let kind = try DeltaModBuilder.archiveKind(archive)
-                if kind == .other {
+                if kind == .other || game == .undertale {
                     let options = try await Task.detached(priority: .userInitiated) {
                         try DeltaModBuilder.manualPatchOptions(archive: archive, supportRoot: AppPaths.support)
                     }.value
+                    if game == .undertale,
+                       installSingleUndertaleXdeltaIfPossible(
+                            options,
+                            archive: archive,
+                            game: game,
+                            modName: modName,
+                            deleteAfterSuccess: true,
+                            gameBananaIconURL: gameBananaIconURL,
+                            gameBananaModID: gameBananaModID,
+                            gameBananaFileID: file.id,
+                            gameBananaFileDateAdded: file.dateAdded
+                       ) {
+                        return
+                    }
                     manualPatchSelection = ManualPatchSelection(
                         archive: archive,
                         modName: modName,
                         options: options,
-                        deleteAfterSuccess: true
+                        deleteAfterSuccess: true,
+                        gameBananaIconURL: gameBananaIconURL,
+                        game: game,
+                        gameBananaModID: gameBananaModID,
+                        gameBananaFileID: file.id,
+                        gameBananaFileDateAdded: file.dateAdded
                     )
                     isBusy = false
-                    statusMessage = "Choose a chapter for each patch to include."
+                    statusMessage = game == .undertale
+                        ? "Choose the Undertale data.win file to patch."
+                        : "Choose a chapter for each patch to include."
                     return
                 }
 
@@ -279,10 +1059,17 @@ final class AppModel: ObservableObject {
                         supportRoot: AppPaths.support
                     )
                 }.value
+                var installed = result.instance
+                installed.game = game
+                installed.gameBananaModID = gameBananaModID
+                installed.gameBananaFileID = file.id
+                installed.gameBananaFileDateAdded = file.dateAdded
+                try JSONEncoder.pretty.encode(installed)
+                    .write(to: result.directory.appendingPathComponent("manifest.json"), options: .atomic)
                 let cleanupMessage = Self.removeDownloadedArchive(archive)
-                instances.insert(result.instance, at: 0)
+                instances.insert(installed, at: 0)
                 isBusy = false
-                statusMessage = "Created instance: \(result.instance.name)" +
+                statusMessage = "Created instance: \(installed.name)" +
                     (cleanupMessage.map { " (\($0))" } ?? "")
             } catch {
                 isBusy = false
@@ -298,6 +1085,42 @@ final class AppModel: ObservableObject {
             return nil
         } catch {
             return "Downloaded archive kept at \(archive.path): \(error.localizedDescription)"
+        }
+    }
+
+    private func addingGameBananaIconIfNeeded(
+        to build: ModBuildResult,
+        from imageURL: URL?
+    ) async -> (instance: ModInstance, warning: String?) {
+        guard build.instance.iconFile == nil, let imageURL else {
+            return (build.instance, nil)
+        }
+        do {
+            let data = try await GameBananaCatalog.downloadImageData(from: imageURL)
+            guard NSImage(data: data) != nil else {
+                throw GameBananaError.badResponse
+            }
+            let pathExtension = ["png", "jpg", "jpeg"].contains(imageURL.pathExtension.lowercased())
+                ? imageURL.pathExtension.lowercased()
+                : "png"
+            let filename = "gamebanana-icon.\(pathExtension)"
+            let iconURL = build.directory.appendingPathComponent(filename)
+            try data.write(to: iconURL, options: .atomic)
+
+            var updated = build.instance
+            updated.iconFile = filename
+            do {
+                try JSONEncoder.pretty.encode(updated)
+                    .write(to: build.directory.appendingPathComponent("manifest.json"), options: .atomic)
+            } catch {
+                try? FileManager.default.removeItem(at: iconURL)
+                throw error
+            }
+            return (updated, nil)
+        } catch {
+            let warning = "GameBanana icon wasn't downloaded: \(error.localizedDescription)"
+            NSLog("%@", warning)
+            return (build.instance, warning)
         }
     }
 
@@ -331,8 +1154,13 @@ final class AppModel: ObservableObject {
             return
         }
         guard !isBusy else { return }
-        let gameApp = URL(fileURLWithPath: settings.gameAppPath)
-        guard !Self.gameIsRunning(at: gameApp) else {
+        let game = instance.targetGame
+        guard isConfigured(for: game) else {
+            errorMessage = "Configure \(game.title) in Settings before launching."
+            return
+        }
+        let gameApp = gameAppURL(for: game)
+        guard !Self.gameIsRunning(at: gameApp, game: game) else {
             errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
             return
         }
@@ -347,7 +1175,7 @@ final class AppModel: ObservableObject {
             do {
                 try Self.prepareRun(instance: instance, settings: settings)
                 DispatchQueue.main.async {
-                    self.openGame(at: gameApp)
+                    self.openGame(at: gameApp, game: game)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -357,6 +1185,31 @@ final class AppModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func launchVanilla(for game: ModGame = .deltarune) {
+        guard settings != nil else {
+            errorMessage = "Complete setup before launching \(game.title)."
+            return
+        }
+        guard !isBusy else { return }
+        guard isConfigured(for: game) else {
+            errorMessage = "Configure \(game.title) in Settings before launching."
+            return
+        }
+        let gameApp = gameAppURL(for: game)
+        guard !Self.gameIsRunning(at: gameApp, game: game) else {
+            errorMessage = ModManagerError.gameAlreadyRunning.localizedDescription
+            return
+        }
+        guard !FileManager.default.fileExists(atPath: Self.journalURL.path) else {
+            errorMessage = ModManagerError.activeRun.localizedDescription
+            return
+        }
+
+        isBusy = true
+        statusMessage = "Launching vanilla \(game.title)..."
+        openGame(at: gameApp, game: game)
     }
 
     func removeInstance(_ instance: ModInstance) {
@@ -375,11 +1228,60 @@ final class AppModel: ObservableObject {
         return AppPaths.instanceDirectory(instance.id).appendingPathComponent(icon)
     }
 
+    func files(for instance: ModInstance) -> [ModInstanceFileEntry] {
+        var files: [String: ModInstanceFileEntry] = [:]
+        for payload in instance.payloads {
+            files[payload.resourcePath] = ModInstanceFileEntry(
+                path: payload.resourcePath,
+                sourceLabel: payload.sourceLabel ?? "Installed mod"
+            )
+        }
+        let customRoot = AppPaths.instanceDirectory(instance.id)
+            .appendingPathComponent("CustomFiles", isDirectory: true)
+        do {
+            for path in try ModCustomFiles.files(in: customRoot).keys {
+                files[path] = ModInstanceFileEntry(path: path, sourceLabel: "Custom files")
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        return files.values.sorted { $0.path.localizedCaseInsensitiveCompare($1.path) == .orderedAscending }
+    }
+
+    func renameInstance(_ instance: ModInstance, to name: String) {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanName.isEmpty else {
+            errorMessage = "A mod instance name cannot be empty."
+            return
+        }
+        guard let current = instances.first(where: { $0.id == instance.id }) else {
+            errorMessage = "This mod instance is no longer available."
+            return
+        }
+        var updated = current
+        updated.name = cleanName
+        do {
+            try JSONEncoder.pretty.encode(updated)
+                .write(to: AppPaths.instanceDirectory(instance.id).appendingPathComponent("manifest.json"), options: .atomic)
+            if let index = instances.firstIndex(where: { $0.id == instance.id }) {
+                instances[index] = updated
+            }
+            statusMessage = "Saved changes to \(cleanName)."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
     func showCustomFilesInFinder(for instance: ModInstance) {
         let directory = AppPaths.instanceDirectory(instance.id)
             .appendingPathComponent("CustomFiles", isDirectory: true)
         do {
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            guard let settings else {
+                errorMessage = "Complete setup before opening custom files."
+                return
+            }
+            let resources = try Self.resourcesURL(for: instance.targetGame, settings: settings)
+            try ModCustomFiles.prepareMirroredDirectories(from: resources, at: directory)
             NSWorkspace.shared.activateFileViewerSelecting([directory])
         } catch {
             errorMessage = error.localizedDescription
@@ -401,9 +1303,54 @@ final class AppModel: ObservableObject {
         AppPaths.activeRun.appendingPathComponent("journal.json")
     }
 
+    nonisolated private static func resourcesURL(for game: ModGame, settings: AppSettings) throws -> URL {
+        switch game {
+        case .deltarune:
+            return try GameAppLocator.resources(for: URL(fileURLWithPath: settings.gameAppPath))
+        case .undertale:
+            guard let path = settings.undertaleAppPath else {
+                throw ModManagerError.invalidGameApp
+            }
+            return try GameAppLocator.undertaleResources(for: URL(fileURLWithPath: path))
+        }
+    }
+
+    nonisolated private static func gameAppPath(for game: ModGame, settings: AppSettings) throws -> String {
+        switch game {
+        case .deltarune:
+            return settings.gameAppPath
+        case .undertale:
+            guard let path = settings.undertaleAppPath else {
+                throw ModManagerError.invalidGameApp
+            }
+            return path
+        }
+    }
+
     private static func loadSettings() -> AppSettings? {
         guard let data = try? Data(contentsOf: AppPaths.settings) else { return nil }
         return try? JSONDecoder().decode(AppSettings.self, from: data)
+    }
+
+    nonisolated private static func removePreviousWindowsBackup(at backup: URL) {
+        removeManagedBackup(at: backup, prefix: "WindowsBackup")
+    }
+
+    nonisolated private static func removeManagedBackup(at backup: URL, prefix: String) {
+        let support = AppPaths.support.standardizedFileURL
+        let standardizedBackup = backup.standardizedFileURL
+        let isManagedBackup = standardizedBackup.lastPathComponent == prefix ||
+            standardizedBackup.lastPathComponent.hasPrefix("\(prefix)-")
+        guard standardizedBackup.deletingLastPathComponent() == support, isManagedBackup else {
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: standardizedBackup.path) {
+                try FileManager.default.removeItem(at: standardizedBackup)
+            }
+        } catch {
+            NSLog("Could not remove previous Windows backup %@: %@", standardizedBackup.path, error.localizedDescription)
+        }
     }
 
     private func loadInstances() {
@@ -420,7 +1367,8 @@ final class AppModel: ObservableObject {
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private func openGame(at gameApp: URL) {
+    private func openGame(at gameApp: URL, game: ModGame) {
+        launchedGame = game
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         NSWorkspace.shared.openApplication(at: gameApp, configuration: configuration) { [weak self] application, error in
@@ -428,25 +1376,27 @@ final class AppModel: ObservableObject {
                 guard let self else { return }
                 if let error {
                     self.restoreActiveRun(showStatus: false)
-                    self.errorMessage = "Could not launch DELTARUNE: \(error.localizedDescription)"
+                    self.errorMessage = "Could not launch \(game.title): \(error.localizedDescription)"
                     self.isBusy = false
                     return
                 }
                 self.launchedProcessID = application?.processIdentifier
                 self.isBusy = false
-                self.statusMessage = "Mod active. The original game files will be restored when DELTARUNE closes."
-                self.watchForGameExit(gameApp: gameApp)
+                self.statusMessage = FileManager.default.fileExists(atPath: Self.journalURL.path)
+                    ? "Mod active. Original game files will be restored when \(game.title) closes."
+                    : "Vanilla \(game.title) is running."
+                self.watchForGameExit(gameApp: gameApp, game: game)
             }
         }
     }
 
-    private func watchForGameExit(gameApp: URL) {
+    private func watchForGameExit(gameApp: URL, game: ModGame) {
         runTimer?.invalidate()
         let startedAt = Date()
         runTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, Date().timeIntervalSince(startedAt) >= 8 else { return }
-                if !Self.gameIsRunning(at: gameApp) {
+                if !Self.gameIsRunning(at: gameApp, game: game) {
                     self.restoreAfterGameExit()
                 }
             }
@@ -498,9 +1448,11 @@ final class AppModel: ObservableObject {
             return
         }
         let gameApp = URL(fileURLWithPath: journal.gameAppPath)
-        if Self.gameIsRunning(at: gameApp) {
-            statusMessage = "A previous modded session is active. Original files will be restored after DELTARUNE closes."
-            watchForGameExit(gameApp: gameApp)
+        let game = journal.game ?? .deltarune
+        launchedGame = game
+        if Self.gameIsRunning(at: gameApp, game: game) {
+            statusMessage = "A previous modded session is active. Original files will be restored after \(game.title) closes."
+            watchForGameExit(gameApp: gameApp, game: game)
         } else {
             restoreActiveRun(showStatus: true)
         }
@@ -514,7 +1466,7 @@ final class AppModel: ObservableObject {
         if fileManager.fileExists(atPath: AppPaths.activeRun.path) {
             try fileManager.removeItem(at: AppPaths.activeRun)
         }
-        let resources = try GameAppLocator.resources(for: URL(fileURLWithPath: settings.gameAppPath))
+        let resources = try resourcesURL(for: instance.targetGame, settings: settings)
         let instanceDirectory = AppPaths.instanceDirectory(instance.id)
         let backupDirectory = AppPaths.activeRun.appendingPathComponent("Backups", isDirectory: true)
         try fileManager.createDirectory(at: backupDirectory, withIntermediateDirectories: true)
@@ -565,10 +1517,11 @@ final class AppModel: ObservableObject {
         }
 
         let journal = ActiveRunJournal(
-            gameAppPath: settings.gameAppPath,
+            gameAppPath: try gameAppPath(for: instance.targetGame, settings: settings),
             resourcePath: resources.path,
             backupDirectory: backupDirectory.path,
-            files: files
+            files: files,
+            game: instance.targetGame
         )
         try fileManager.createDirectory(at: AppPaths.activeRun, withIntermediateDirectories: true)
         try JSONEncoder.pretty.encode(journal).write(to: Self.journalURL, options: .atomic)
@@ -653,10 +1606,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private static func gameIsRunning(at gameApp: URL) -> Bool {
+    private static func gameIsRunning(at gameApp: URL, game: ModGame = .deltarune) -> Bool {
         let expected = gameApp.standardizedFileURL.path
-        return NSWorkspace.shared.runningApplications.contains {
+        let appIsRunning = NSWorkspace.shared.runningApplications.contains {
             $0.bundleURL?.standardizedFileURL.path == expected
+        }
+        return appIsRunning || (game == .undertale && undertaleProcessIsRunning())
+    }
+
+    nonisolated private static func undertaleProcessIsRunning() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-if", "undertale"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            NSLog("Could not check whether Undertale is running: %@", error.localizedDescription)
+            return true
         }
     }
 }
